@@ -1519,7 +1519,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.time_embed = TimestepEmbedder(hidden_size=config.hidden_size)
 
         # vision
-        self.vision_model = Siglip2VisionTransformer(config.vit)
+        self.vision_model = Siglip2VisionTransformer(
+            config.vit,
+            quant_config=quant_config,
+            prefix="vision_model",
+        )
         self.vision_aligner = LightProjector(config.vit_aligner)
 
         # Used to embed timestep information into the input sequence.
@@ -1829,10 +1833,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if pixel_values.shape[0] == 0:
             return None
 
-        vision_output = self.vision_model(
+        image_embed = self.vision_model(
             pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
         )
-        image_embed = vision_output.last_hidden_state
         image_embed = self.vision_aligner(image_embed)
         return image_embed
 
