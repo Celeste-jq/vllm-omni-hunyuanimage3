@@ -56,6 +56,13 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 logger = init_logger(__name__)
 
 
+def _is_hunyuan_vit_use_data_parallel(multimodal_config=None) -> bool:
+    mm_encoder_tp_mode = None if multimodal_config is None else getattr(multimodal_config, "mm_encoder_tp_mode", None)
+    if mm_encoder_tp_mode is not None:
+        return mm_encoder_tp_mode == "data"
+    return is_vit_use_data_parallel()
+
+
 class Config:
     """Convert dict config to object with attribute access."""
 
@@ -141,6 +148,7 @@ class Siglip2Attention(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config=None,
         prefix: str = "",
     ):
         super().__init__()
@@ -149,7 +157,7 @@ class Siglip2Attention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        use_data_parallel = is_vit_use_data_parallel()
+        use_data_parallel = _is_hunyuan_vit_use_data_parallel(multimodal_config)
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
@@ -214,10 +222,11 @@ class Siglip2MLP(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config=None,
         prefix: str = "",
     ):
         super().__init__()
-        use_data_parallel = is_vit_use_data_parallel()
+        use_data_parallel = _is_hunyuan_vit_use_data_parallel(multimodal_config)
         self.activation_fn = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
@@ -246,6 +255,7 @@ class Siglip2EncoderLayer(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config=None,
         prefix: str = "",
     ):
         super().__init__()
@@ -253,12 +263,14 @@ class Siglip2EncoderLayer(nn.Module):
         self.self_attn = Siglip2Attention(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.self_attn",
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Siglip2MLP(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.mlp",
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -292,6 +304,7 @@ class Siglip2Encoder(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config=None,
         prefix: str = "",
     ):
         super().__init__()
@@ -300,6 +313,7 @@ class Siglip2Encoder(nn.Module):
                 Siglip2EncoderLayer(
                     config,
                     quant_config=quant_config,
+                    multimodal_config=multimodal_config,
                     prefix=f"{prefix}.layers.{idx}",
                 )
                 for idx in range(config.num_hidden_layers)
@@ -326,29 +340,33 @@ class Siglip2VisionTransformer(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config=None,
         prefix: str = "",
     ):
         super().__init__()
         config = Config(config)
         self.config = config
         self.embed_dim = config.hidden_size
-        use_data_parallel = is_vit_use_data_parallel()
+        use_data_parallel = _is_hunyuan_vit_use_data_parallel(multimodal_config)
+        mm_encoder_tp_mode = None if multimodal_config is None else getattr(multimodal_config, "mm_encoder_tp_mode", None)
         try:
             decoder_tp_size = get_tensor_model_parallel_world_size()
         except Exception:
             decoder_tp_size = -1
         vit_tp_size = 1 if use_data_parallel else decoder_tp_size
         logger.info(
-            "HunyuanImage3 SigLIP2 init: use_data_parallel=%s, vit_tp_size=%s, decoder_tp_size=%s",
+            "HunyuanImage3 SigLIP2 init: use_data_parallel=%s, vit_tp_size=%s, decoder_tp_size=%s, mm_encoder_tp_mode=%s",
             use_data_parallel,
             vit_tp_size,
             decoder_tp_size,
+            mm_encoder_tp_mode,
         )
 
         self.embeddings = Siglip2VisionEmbeddings(config)
         self.encoder = Siglip2Encoder(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.encoder" if prefix else "encoder",
         )
         self.post_layernorm = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
