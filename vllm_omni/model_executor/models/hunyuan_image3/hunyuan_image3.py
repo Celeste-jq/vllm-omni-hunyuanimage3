@@ -92,6 +92,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
@@ -1557,18 +1558,26 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # Special token IDs for logits processors (stage transitions).
         # These mirror the official tokenization_hunyuan_image_3.py setup.
-        self._end_of_think_id = tokenizer.convert_tokens_to_ids("</think>")
-        self._recaption_id = tokenizer.convert_tokens_to_ids("<recaption>")
-        self._end_of_recaption_id = tokenizer.convert_tokens_to_ids("</recaption>")
-        self._answer_id = tokenizer.convert_tokens_to_ids("<answer>")
-        self._end_of_answer_id = tokenizer.convert_tokens_to_ids("</answer>")
+        def resolve_known_special_token_id(token: str) -> int:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is None:
+                token_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.get(token)
+            if token_id is None:
+                raise ValueError(f"HunyuanImage3 special token {token!r} is missing from tokenizer and fallback map")
+            return int(token_id)
+
+        self._end_of_think_id = resolve_known_special_token_id("</think>")
+        self._recaption_id = resolve_known_special_token_id("<recaption>")
+        self._end_of_recaption_id = resolve_known_special_token_id("</recaption>")
+        self._answer_id = resolve_known_special_token_id("<answer>")
+        self._end_of_answer_id = resolve_known_special_token_id("</answer>")
         image_base_size = getattr(config, "image_base_size", 1024)
-        self._size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{image_base_size}>")
+        self._size_token_id = resolve_known_special_token_id(f"<img_size_{image_base_size}>")
         self._timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
-        self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
-        self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
-        ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
-        ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
+        self._start_ratio_id = resolve_known_special_token_id("<img_ratio_0>")
+        self._end_ratio_id = resolve_known_special_token_id("<img_ratio_32>")
+        ratio_33 = resolve_known_special_token_id("<img_ratio_33>")
+        ratio_36 = resolve_known_special_token_id("<img_ratio_36>")
         self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
         # Build the full set of ratio token IDs for use as stop tokens.
         self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
