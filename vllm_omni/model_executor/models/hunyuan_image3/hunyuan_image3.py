@@ -4,7 +4,7 @@ import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Literal, TypeAlias
+from typing import Any, ClassVar, Literal, TypeAlias
 
 import numpy as np
 import regex as re
@@ -1457,6 +1457,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
+    supports_encoder_tp_data: ClassVar[bool] = True
     prefer_model_sampler = True
 
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
