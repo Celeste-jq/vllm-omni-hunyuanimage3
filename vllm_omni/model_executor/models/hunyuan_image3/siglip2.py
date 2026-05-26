@@ -40,6 +40,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
@@ -51,6 +52,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+
+logger = init_logger(__name__)
 
 
 class Config:
@@ -329,6 +332,18 @@ class Siglip2VisionTransformer(nn.Module):
         config = Config(config)
         self.config = config
         self.embed_dim = config.hidden_size
+        use_data_parallel = is_vit_use_data_parallel()
+        try:
+            decoder_tp_size = get_tensor_model_parallel_world_size()
+        except Exception:
+            decoder_tp_size = -1
+        vit_tp_size = 1 if use_data_parallel else decoder_tp_size
+        logger.info(
+            "HunyuanImage3 SigLIP2 init: use_data_parallel=%s, vit_tp_size=%s, decoder_tp_size=%s",
+            use_data_parallel,
+            vit_tp_size,
+            decoder_tp_size,
+        )
 
         self.embeddings = Siglip2VisionEmbeddings(config)
         self.encoder = Siglip2Encoder(
