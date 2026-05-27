@@ -107,14 +107,14 @@ count_literal() {
 
 extract_local_counts() {
   local path="$1"
-  grep -F "HunyuanImage3 AR ViT DP shard:" "$path" \
+  { grep -F "HunyuanImage3 AR ViT DP shard:" "$path" || true; } \
     | sed -n 's/.*local_count=\([0-9][0-9]*\).*/\1/p' \
     | paste -sd';' -
 }
 
 count_nonzero_local_counts() {
   local path="$1"
-  grep -F "HunyuanImage3 AR ViT DP shard:" "$path" \
+  { grep -F "HunyuanImage3 AR ViT DP shard:" "$path" || true; } \
     | sed -n 's/.*local_count=\([0-9][0-9]*\).*/\1/p' \
     | awk '$1 > 0 { n += 1 } END { print n + 0 }'
 }
