@@ -1483,8 +1483,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
-
         # Use mRoPE to preserve 2D positional encoding for image tokens.
         if isinstance(config.rope_parameters, dict):
             config.rope_parameters["rope_type"] = "default"
@@ -1498,7 +1496,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.config = config
         self.quant_config = quant_config
         self.vllm_config = vllm_config
-        self.multimodal_config = multimodal_config
         self.model = HunyuanModel(vllm_config=vllm_config, prefix="model")
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size
@@ -1542,7 +1539,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.vision_model = Siglip2VisionTransformer(
             config.vit,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix="vision_model",
         )
         self.vision_aligner = LightProjector(config.vit_aligner)
