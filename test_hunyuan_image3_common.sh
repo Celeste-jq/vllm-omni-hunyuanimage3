@@ -85,6 +85,12 @@ static_check_siglip_forward_stats_hook() {
     "SigLIP2 forward local-input instrumentation is missing."
 }
 
+assert_ar_vit_dp_shard_log() {
+  local log_file="$1"
+  assert_literal "HunyuanImage3 AR ViT DP shard:" "$log_file" \
+    "AR ViT-DP sharding log is missing."
+}
+
 run_hunyuan_example() {
   local log_file="$1"
   shift

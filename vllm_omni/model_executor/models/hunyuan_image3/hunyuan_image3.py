@@ -23,7 +23,9 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
@@ -58,6 +60,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -1841,6 +1844,53 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Handle empty batch
         if pixel_values.shape[0] == 0:
             return None
+
+        if is_vit_use_data_parallel():
+            batch_size = pixel_values.shape[0]
+            max_patches = pixel_values.shape[1]
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            local_batch_size = math.ceil(batch_size / tp_size)
+            local_start = tp_rank * local_batch_size
+            local_end = min(local_start + local_batch_size, batch_size)
+            local_count = max(local_end - local_start, 0)
+
+            logger.info(
+                "HunyuanImage3 AR ViT DP shard: tp_rank=%s, tp_size=%s, global_batch=%s, "
+                "local_range=[%s,%s), local_count=%s, local_batch_size=%s",
+                tp_rank,
+                tp_size,
+                batch_size,
+                local_start,
+                local_end,
+                local_count,
+                local_batch_size,
+            )
+
+            if local_count > 0:
+                local_embed = self.vision_model(
+                    pixel_values[local_start:local_end],
+                    attention_mask=vit_attention_mask[local_start:local_end],
+                    spatial_shapes=vit_spatial_shapes[local_start:local_end],
+                )
+                local_embed = self.vision_aligner(local_embed)
+            else:
+                aligner_param = next(self.vision_aligner.parameters())
+                local_embed = pixel_values.new_zeros(
+                    (0, max_patches, self.config.hidden_size),
+                    dtype=aligner_param.dtype,
+                )
+
+            if local_embed.shape[0] < local_batch_size:
+                pad = local_embed.new_zeros(
+                    local_batch_size - local_embed.shape[0],
+                    max_patches,
+                    local_embed.shape[-1],
+                )
+                local_embed = torch.cat((local_embed, pad), dim=0)
+
+            image_embed = tensor_model_parallel_all_gather(local_embed, dim=0)
+            return image_embed[:batch_size]
 
         image_embed = self.vision_model(
             pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
