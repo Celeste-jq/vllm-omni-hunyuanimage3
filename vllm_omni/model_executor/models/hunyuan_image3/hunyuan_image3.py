@@ -60,6 +60,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
