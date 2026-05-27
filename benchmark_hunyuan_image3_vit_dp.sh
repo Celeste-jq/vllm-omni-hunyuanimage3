@@ -43,6 +43,7 @@ Optional environment variables:
 
 What it records:
   - total wall time per run
+  - processed prompts latency from tqdm when available
   - whether text/image output markers appeared
   - ViT-DP init marker count
   - SigLIP2 forward local-input log count
@@ -123,10 +124,41 @@ extract_processed_prompts_line() {
   grep -F "Processed prompts:" "$path" | tail -1 | tr -d '\r' || true
 }
 
+extract_processed_prompts_seconds() {
+  local line="$1"
+  if [[ -z "$line" ]]; then
+    return 0
+  fi
+  LINE="$line" awk '
+    BEGIN {
+      line = ENVIRON["LINE"]
+      n = split(line, parts, "[")
+      for (i = n; i >= 1; --i) {
+        if (parts[i] ~ /[0-9.]+s\/it/) {
+          if (match(parts[i], /[0-9.]+s\/it/)) {
+            value = substr(parts[i], RSTART, RLENGTH)
+            sub(/s\/it/, "", value)
+            print value
+            exit
+          }
+        }
+        if (parts[i] ~ /[0-9]+:[0-9][0-9]</) {
+          if (match(parts[i], /[0-9]+:[0-9][0-9]</)) {
+            value = substr(parts[i], RSTART, RLENGTH - 1)
+            split(value, mmss, ":")
+            print (mmss[1] * 60 + mmss[2])
+            exit
+          }
+        }
+      }
+    }
+  '
+}
+
 write_header() {
   if [[ ! -f "$METRICS_CSV" ]]; then
     printf '%s\n' \
-      "run,branch,commit,task,modality,deploy_config,elapsed_s,output_text,output_image,vit_init_true_count,vit_forward_count,shard_log_count,shard_nonzero_count,shard_local_counts,processed_prompts_line,log_file" \
+      "run,branch,commit,task,modality,deploy_config,elapsed_s,processed_prompts_s,output_text,output_image,vit_init_true_count,vit_forward_count,shard_log_count,shard_nonzero_count,shard_local_counts,processed_prompts_line,log_file" \
       > "$METRICS_CSV"
   fi
 }
@@ -178,6 +210,7 @@ for run in $(seq 1 "$RUNS"); do
   shard_nonzero_count="$(count_nonzero_local_counts "$log_file")"
   shard_local_counts="$(extract_local_counts "$log_file")"
   processed_line="$(extract_processed_prompts_line "$log_file")"
+  processed_prompts_s="$(extract_processed_prompts_seconds "$processed_line")"
 
   {
     printf '%s,' "$run"
@@ -186,8 +219,9 @@ for run in $(seq 1 "$RUNS"); do
     csv_escape "$TASK"; printf ','
     csv_escape "$MODALITY"; printf ','
     csv_escape "$DEPLOY_CONFIG"; printf ','
-    printf '%s,%s,%s,%s,%s,%s,%s,' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,' \
       "$elapsed_s" \
+      "$processed_prompts_s" \
       "$output_text" \
       "$output_image" \
       "$vit_init_true_count" \
@@ -200,7 +234,7 @@ for run in $(seq 1 "$RUNS"); do
     printf '\n'
   } >> "$METRICS_CSV"
 
-  echo "[metrics] run=$run elapsed_s=$elapsed_s output_text=$output_text output_image=$output_image vit_forward_count=$vit_forward_count shard_local_counts=${shard_local_counts:-<none>}"
+  echo "[metrics] run=$run elapsed_s=$elapsed_s processed_prompts_s=${processed_prompts_s:-<none>} output_text=$output_text output_image=$output_image vit_forward_count=$vit_forward_count shard_local_counts=${shard_local_counts:-<none>}"
 done
 
 echo "[done] Metrics written to $METRICS_CSV"
