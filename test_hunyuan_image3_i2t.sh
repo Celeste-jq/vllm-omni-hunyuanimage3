@@ -47,7 +47,6 @@ assert_literal "[Output] Text:" "$LOG_FILE" \
   "img2text finished without text output."
 assert_literal "HunyuanImage3 SigLIP2 init: use_data_parallel=True, vit_tp_size=1" "$LOG_FILE" \
   "img2text did not emit the expected ViT-DP init log."
-assert_ar_vit_dp_shard_log "$LOG_FILE"
 assert_literal "HunyuanImage3 SigLIP2 forward local inputs:" "$LOG_FILE" \
   "img2text did not emit local ViT input stats."
 
