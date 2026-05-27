@@ -1542,6 +1542,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             prefix="vision_model",
         )
         self.vision_aligner = LightProjector(config.vit_aligner)
+        self._logged_vit_encode_state = False
 
         # Used to embed timestep information into the input sequence.
         self.timestep_emb = TimestepEmbedder(hidden_size=config.hidden_size)
@@ -1857,6 +1858,22 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # so this returns on all ranks together without collective-op deadlock.
         if pixel_values.shape[0] == 0:
             return None
+
+        if not self._logged_vit_encode_state:
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                tp_size = -1
+                tp_rank = -1
+            logger.info(
+                "HunyuanImage3 AR ViT encode state: use_data_parallel=%s, tp_rank=%s, tp_size=%s, batch_size=%s",
+                self.use_data_parallel,
+                tp_rank,
+                tp_size,
+                pixel_values.shape[0],
+            )
+            self._logged_vit_encode_state = True
 
         if self.use_data_parallel:
             # ViT weights are replicated (disable_tp on every linear); shard the
