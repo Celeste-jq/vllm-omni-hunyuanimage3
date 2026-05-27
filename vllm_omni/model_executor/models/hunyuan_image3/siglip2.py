@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import divide, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.linear import (
@@ -351,6 +351,7 @@ class Siglip2VisionTransformer(nn.Module):
             prefix=f"{prefix}.encoder" if prefix else "encoder",
         )
         self.post_layernorm = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self._logged_forward_input_stats = False
 
     def forward(
         self,
@@ -378,6 +379,23 @@ class Siglip2VisionTransformer(nn.Module):
         seq_lens = (spatial_shapes[:, 0] * spatial_shapes[:, 1]).to(torch.int32)
         cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=pixel_values.device)
         cu_seqlens[1:] = seq_lens.cumsum(0)
+
+        if not self._logged_forward_input_stats:
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                tp_rank = -1
+            logger.info(
+                "HunyuanImage3 SigLIP2 forward local inputs: tp_rank=%s, batch_size=%s, max_patches=%s, "
+                "packed_patches=%s, spatial_shapes=%s, seq_lens=%s",
+                tp_rank,
+                batch_size,
+                max_patches,
+                packed_pixels.shape[0],
+                spatial_shapes.detach().cpu().tolist(),
+                seq_lens.detach().cpu().tolist(),
+            )
+            self._logged_forward_input_stats = True
 
         # Embeddings (packed)
         hidden_states = self.embeddings(packed_pixels, spatial_shapes)
