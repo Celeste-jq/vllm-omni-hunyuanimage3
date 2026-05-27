@@ -60,7 +60,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
-from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -1845,7 +1844,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if pixel_values.shape[0] == 0:
             return None
 
-        if is_vit_use_data_parallel():
+        if self.vision_model.use_data_parallel:
             batch_size = pixel_values.shape[0]
             max_patches = pixel_values.shape[1]
             tp_size = get_tensor_model_parallel_world_size()
