@@ -195,6 +195,76 @@ def resolve_mode_label(args: argparse.Namespace) -> str:
     return Path(args.deploy_config).stem
 
 
+def resolve_effective_stage_preview(
+    deploy_config: Path,
+    *,
+    platform: str = "npu",
+    stage_id: int = 0,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Best-effort preview of the final stage config after platform overrides."""
+    try:
+        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+    except Exception as exc:
+        return None, f"unable to import stage config helpers: {exc}"
+
+    try:
+        deploy = load_deploy_config(deploy_config)
+        deploy = _apply_platform_overrides(deploy, platform)
+        stage = next((s for s in deploy.stages if s.stage_id == stage_id), None)
+        if stage is None:
+            return None, f"stage_id={stage_id} not found"
+        keys = (
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "devices",
+            "tensor_parallel_size",
+            "gpu_memory_utilization",
+        )
+        preview = {key: getattr(stage, key, None) for key in keys}
+        preview.update(getattr(stage, "engine_extras", {}) or {})
+        return preview, None
+    except Exception as exc:
+        return None, f"unable to resolve deploy config: {exc}"
+
+
+def print_deploy_preflight(
+    *,
+    args: argparse.Namespace,
+    deploy_config: Path,
+    prompts: list[dict[str, Any]],
+) -> None:
+    preview, error = resolve_effective_stage_preview(deploy_config)
+    if error:
+        print(f"[preflight] effective_config=unavailable ({error})")
+    else:
+        print(f"[preflight] effective_npu_stage0={preview}")
+        max_num_seqs = preview.get("max_num_seqs")
+        if isinstance(max_num_seqs, int) and max_num_seqs < args.batch_size:
+            print(
+                "[preflight][warning] max_num_seqs is smaller than batch_size; "
+                f"scheduler cannot admit all requests together ({max_num_seqs} < {args.batch_size})."
+            )
+
+        max_num_batched_tokens = preview.get("max_num_batched_tokens")
+        # HunyuanImage3 AR image requests are large; recent NPU logs for this
+        # model show about 12.8k tokens/request. Keep this as a warning only.
+        recommended_tokens = 12800 * args.batch_size
+        if isinstance(max_num_batched_tokens, int) and max_num_batched_tokens < recommended_tokens:
+            print(
+                "[preflight][warning] max_num_batched_tokens may be too small for "
+                f"batch_size={args.batch_size}; observed HunyuanImage3 image runs need "
+                f"about >= {recommended_tokens} to batch {args.batch_size} requests "
+                f"(current={max_num_batched_tokens})."
+            )
+
+    prompt_lens = [len(p.get("prompt_token_ids") or []) for p in prompts]
+    if prompt_lens:
+        print(
+            "[preflight] prompt_token_lens="
+            f"min={min(prompt_lens)} max={max(prompt_lens)} batch_size={len(prompt_lens)}"
+        )
+
+
 def build_formatted_prompts(
     *,
     model: str,
@@ -276,6 +346,7 @@ def run_mode(args: argparse.Namespace) -> int:
         image_path=args.image_path,
         batch_size=args.batch_size,
     )
+    print_deploy_preflight(args=args, deploy_config=deploy_config, prompts=prompts)
 
     omni = Omni(
         model=args.model,
