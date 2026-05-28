@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Compare HunyuanImage3 AR ViT DP on/off with multi-request batching and profiling."""
+"""Run HunyuanImage3 AR img2text batches with an explicit deploy yaml."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -29,14 +27,14 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run HunyuanImage3 img2text AR-only comparison with ViT DP on/off and torch profiling."
+        description="Run HunyuanImage3 img2text AR-only batching with an explicit deploy yaml and optional profiling."
     )
     parser.add_argument("--model", required=True, help="Model path or HF ID.")
     parser.add_argument("--image-path", required=True, help="Input image path. Comma-separated paths also supported.")
     parser.add_argument(
         "--deploy-config",
         default=str(DEFAULT_DEPLOY),
-        help="Base AR deploy config. The script derives DP-on/off temp configs from it.",
+        help="AR deploy config to use as-is for this run.",
     )
     parser.add_argument(
         "--prompt",
@@ -64,7 +62,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-root",
         default=None,
-        help="Root directory for logs, summaries, temporary deploy configs, and profiler artifacts.",
+        help="Root directory for logs, summaries, and profiler artifacts.",
+    )
+    parser.add_argument(
+        "--mode-label",
+        default=None,
+        help="Optional output subdirectory label. Defaults to the deploy config stem.",
     )
     parser.add_argument(
         "--profiler-config",
@@ -147,12 +150,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Allow compiled mode if your environment wants it.",
     )
-
-    # Internal child-runner flags.
-    parser.add_argument("--_mode-run", choices=["vit_dp_on", "vit_dp_off"], default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_resolved-output-root", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_resolved-profiler-dir", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_resolved-deploy-config", default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -187,135 +184,15 @@ def make_output_root(requested: str | None) -> Path:
         root = Path(requested).expanduser().resolve()
     else:
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        root = (REPO_ROOT / "test_outputs" / f"hunyuan_image3_vit_dp_profile_compare_{stamp}").resolve()
+        root = (REPO_ROOT / "test_outputs" / f"hunyuan_image3_vit_dp_profile_{stamp}").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def write_temp_deploy_configs(base_deploy_path: Path, output_root: Path, batch_size: int) -> dict[str, Path]:
-    base_text = base_deploy_path.read_text(encoding="utf-8")
-    if "mm_encoder_tp_mode: data" not in base_text:
-        raise ValueError(
-            f"Base deploy config does not contain 'mm_encoder_tp_mode: data': {base_deploy_path}"
-        )
-
-    deploy_dir = output_root / "deploy_configs"
-    deploy_dir.mkdir(parents=True, exist_ok=True)
-
-    on_path = deploy_dir / "hunyuan_image3_ar_vit_dp_on.yaml"
-    off_path = deploy_dir / "hunyuan_image3_ar_vit_dp_off.yaml"
-
-    adjusted_max_num_seqs = False
-    off_lines: list[str] = []
-    on_lines: list[str] = []
-    for line in base_text.splitlines():
-        if line.lstrip().startswith("max_num_seqs:"):
-            indent = line[: len(line) - len(line.lstrip())]
-            rewritten = f"{indent}max_num_seqs: {max(1, batch_size)}"
-            on_lines.append(rewritten)
-            off_lines.append(rewritten)
-            adjusted_max_num_seqs = True
-            continue
-        on_lines.append(line)
-        if "mm_encoder_tp_mode:" in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            off_lines.append(f"{indent}# mm_encoder_tp_mode removed for ViT TP baseline")
-            continue
-        off_lines.append(line)
-    if not adjusted_max_num_seqs:
-        raise ValueError(f"Base deploy config does not contain max_num_seqs: {base_deploy_path}")
-    on_text = "\n".join(on_lines) + ("\n" if base_text.endswith("\n") else "")
-    off_text = "\n".join(off_lines) + ("\n" if base_text.endswith("\n") else "")
-
-    on_path.write_text(on_text, encoding="utf-8")
-    off_path.write_text(off_text, encoding="utf-8")
-    return {"vit_dp_on": on_path, "vit_dp_off": off_path}
-
-
-def launch_child(args: argparse.Namespace, output_root: Path, mode: str, deploy_config: Path) -> tuple[int, Path]:
-    mode_dir = output_root / mode
-    mode_dir.mkdir(parents=True, exist_ok=True)
-    profiler_dir = mode_dir / "profiler"
-    profiler_dir.mkdir(parents=True, exist_ok=True)
-    log_file = mode_dir / f"{mode}.log"
-
-    child_cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--model",
-        args.model,
-        "--image-path",
-        args.image_path,
-        "--deploy-config",
-        str(args.deploy_config),
-        "--prompt",
-        args.prompt,
-        "--batch-size",
-        str(args.batch_size),
-        "--warmup-runs",
-        str(args.warmup_runs),
-        "--profile-runs",
-        str(args.profile_runs),
-        "--init-timeout",
-        str(args.init_timeout),
-        "--_mode-run",
-        mode,
-        "--_resolved-output-root",
-        str(output_root),
-        "--_resolved-profiler-dir",
-        str(profiler_dir),
-        "--_resolved-deploy-config",
-        str(deploy_config),
-    ]
-
-    if args.profiler_config is not None:
-        child_cmd.extend(["--profiler-config", json.dumps(args.profiler_config)])
-    if args.profiler_record_shapes:
-        child_cmd.append("--profiler-record-shapes")
-    if args.profiler_with_stack:
-        child_cmd.append("--profiler-with-stack")
-    if args.profiler_with_memory:
-        child_cmd.append("--profiler-with-memory")
-    if args.profiler_use_gzip:
-        child_cmd.append("--profiler-use-gzip")
-    if args.profiler_with_flops:
-        child_cmd.append("--profiler-with-flops")
-    if args.profiler_dump_cuda_time_total:
-        child_cmd.append("--profiler-dump-cuda-time-total")
-    if not args.enable_profiler:
-        child_cmd.append("--disable-profiler")
-    if args.enable_ar_profiler:
-        child_cmd.append("--enable-ar-profiler")
-    else:
-        child_cmd.append("--disable-ar-profiler")
-    if args.log_stats:
-        child_cmd.append("--log-stats")
-    if args.enforce_eager:
-        child_cmd.append("--enforce-eager")
-    else:
-        child_cmd.append("--disable-enforce-eager")
-
-    print(f"[parent] Launch {mode}")
-    print(f"[parent]   deploy_config={deploy_config}")
-    print(f"[parent]   log_file={log_file}")
-    print(f"[parent]   profiler_dir={profiler_dir}")
-
-    with log_file.open("w", encoding="utf-8") as log_fp:
-        proc = subprocess.Popen(
-            child_cmd,
-            cwd=str(REPO_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            log_fp.write(line)
-        return_code = proc.wait()
-
-    return return_code, log_file
+def resolve_mode_label(args: argparse.Namespace) -> str:
+    if args.mode_label:
+        return args.mode_label
+    return Path(args.deploy_config).stem
 
 
 def build_formatted_prompts(
@@ -365,19 +242,17 @@ def build_formatted_prompts(
 def run_mode(args: argparse.Namespace) -> int:
     from vllm_omni.entrypoints.omni import Omni
 
-    mode = args._mode_run
-    assert mode in {"vit_dp_on", "vit_dp_off"}
-    output_root = Path(args._resolved_output_root).resolve()
+    mode = resolve_mode_label(args)
+    output_root = make_output_root(args.output_root)
     mode_dir = output_root / mode
     mode_dir.mkdir(parents=True, exist_ok=True)
-    profiler_dir = Path(args._resolved_profiler_dir).resolve()
+    profiler_dir = mode_dir / "profiler"
     profiler_dir.mkdir(parents=True, exist_ok=True)
-    deploy_config = Path(args._resolved_deploy_config).resolve()
+    deploy_config = ensure_path_exists(args.deploy_config, "deploy config")
 
     image_paths = [p.strip() for p in args.image_path.split(",") if p.strip()]
     for image_path in image_paths:
         ensure_path_exists(image_path, "image path")
-    ensure_path_exists(deploy_config, "resolved deploy config")
 
     profiler_config = resolve_profiler_config(args, profiler_dir)
     if profiler_config is not None:
@@ -501,42 +376,6 @@ def run_mode(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_parent(args: argparse.Namespace) -> int:
-    base_deploy = ensure_path_exists(args.deploy_config, "deploy config")
-    output_root = make_output_root(args.output_root)
-    deploy_configs = write_temp_deploy_configs(base_deploy, output_root, batch_size=args.batch_size)
-
-    results: dict[str, Any] = {"output_root": str(output_root), "modes": {}}
-    for mode in ("vit_dp_on", "vit_dp_off"):
-        return_code, log_file = launch_child(args, output_root, mode, deploy_configs[mode])
-        mode_dir = output_root / mode
-        summary_path = mode_dir / "summary.json"
-        results["modes"][mode] = {
-            "return_code": return_code,
-            "log_file": str(log_file),
-            "summary_json": str(summary_path),
-            "deploy_config": str(deploy_configs[mode]),
-        }
-        if return_code != 0:
-            results_path = output_root / "compare_summary.json"
-            results_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[error] mode {mode} failed, see {log_file}", file=sys.stderr)
-            print(f"[error] partial summary written to {results_path}", file=sys.stderr)
-            return return_code
-
-    results_path = output_root / "compare_summary.json"
-    results_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print("=" * 72)
-    print("[compare] finished")
-    print(f"[compare] output_root={output_root}")
-    print(f"[compare] compare_summary={results_path}")
-    print(f"[compare] vit_dp_on log={results['modes']['vit_dp_on']['log_file']}")
-    print(f"[compare] vit_dp_off log={results['modes']['vit_dp_off']['log_file']}")
-    print("=" * 72)
-    return 0
-
-
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -546,9 +385,7 @@ def main() -> int:
         parser.error("--warmup-runs must be >= 0")
     if args.profile_runs <= 0:
         parser.error("--profile-runs must be > 0")
-    if args._mode_run is not None:
-        return run_mode(args)
-    return run_parent(args)
+    return run_mode(args)
 
 
 if __name__ == "__main__":

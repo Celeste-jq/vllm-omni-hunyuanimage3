@@ -18,31 +18,18 @@ def _load_module():
     return module
 
 
-def test_write_temp_deploy_configs_updates_max_num_seqs(tmp_path: Path):
+def test_resolve_mode_label_uses_explicit_value(tmp_path: Path):
     module = _load_module()
-    base_deploy = tmp_path / "base.yaml"
-    base_deploy.write_text(
-        "\n".join(
-            [
-                "pipeline: hunyuan_image3_ar",
-                "stages:",
-                "  - stage_id: 0",
-                "    max_num_seqs: 1",
-                "    mm_encoder_tp_mode: data",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    args = Namespace(mode_label="manual_label", deploy_config=str(tmp_path / "deploy.yaml"))
 
-    configs = module.write_temp_deploy_configs(base_deploy, tmp_path, batch_size=8)
+    assert module.resolve_mode_label(args) == "manual_label"
 
-    on_text = configs["vit_dp_on"].read_text(encoding="utf-8")
-    off_text = configs["vit_dp_off"].read_text(encoding="utf-8")
-    assert "max_num_seqs: 8" in on_text
-    assert "max_num_seqs: 8" in off_text
-    assert "mm_encoder_tp_mode: data" in on_text
-    assert "mm_encoder_tp_mode: data" not in off_text
+
+def test_resolve_mode_label_falls_back_to_deploy_stem(tmp_path: Path):
+    module = _load_module()
+    args = Namespace(mode_label=None, deploy_config=str(tmp_path / "hunyuan_image3_ar_custom.yaml"))
+
+    assert module.resolve_mode_label(args) == "hunyuan_image3_ar_custom"
 
 
 def test_resolve_profiler_config_returns_none_when_disabled(tmp_path: Path):
