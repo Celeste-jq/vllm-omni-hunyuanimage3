@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -265,6 +266,10 @@ def print_deploy_preflight(
         )
 
 
+def build_request_mm_uuids(req_idx: int, num_images: int) -> dict[str, list[str]]:
+    return {"image": [f"req-{req_idx}-image-{image_idx}" for image_idx in range(num_images)]}
+
+
 def build_formatted_prompts(
     *,
     model: str,
@@ -294,7 +299,7 @@ def build_formatted_prompts(
     mm_payload = images[0] if len(images) == 1 else images
 
     formatted_prompts: list[dict[str, Any]] = []
-    for _ in range(batch_size):
+    for req_idx in range(batch_size):
         result = build_prompt_tokens(prompt, tokenizer, task="i2t", bot_task=None, sys_type=None, num_images=len(images))
         formatted_prompts.append(
             {
@@ -303,10 +308,110 @@ def build_formatted_prompts(
                 "use_system_prompt": None,
                 "modalities": ["text"],
                 "multi_modal_data": {"image": mm_payload},
+                # Give each request a distinct multimodal cache key so repeated
+                # use of the same image still exercises runtime ViT encoding.
+                "multi_modal_uuids": build_request_mm_uuids(req_idx, len(images)),
                 "stop_token_ids": token_stop_ids,
             }
         )
     return formatted_prompts, images
+
+
+def generate_with_batch_admission(omni: Any, prompts: list[dict[str, Any]], sampling_params_list: list[Any]) -> list[Any]:
+    """Preprocess a full batch before enqueueing, so the scheduler can see it together."""
+    from tqdm.auto import tqdm
+
+    from vllm_omni.engine.messages import OutputMessage
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+    from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+
+    sampling_params_list = list(omni.resolve_sampling_params_list(sampling_params_list))
+    sampling_params_list = omni._set_final_only_for_llm_stages(sampling_params_list)
+
+    request_ids = [f"{i}_{uuid.uuid4()}" for i in range(len(prompts))]
+    wall_start_ts = time.time()
+    req_start_ts: dict[str, float] = {}
+    req_final_stage_ids: dict[str, int] = {}
+    pending_msgs: list[tuple[str, Any]] = []
+
+    try:
+        for req_id, prompt in zip(request_ids, prompts):
+            prompt_modalities = prompt.get("modalities", None)
+            final_stage_id = omni._compute_final_stage_id(prompt_modalities)
+            req_final_stage_ids[req_id] = final_stage_id
+
+            metrics = OrchestratorMetrics(
+                omni.num_stages,
+                omni.log_stats,
+                wall_start_ts,
+                final_stage_id,
+            )
+            req_state = ClientRequestState(req_id)
+            req_state.metrics = metrics
+            omni.request_states[req_id] = req_state
+
+            req_sp_list = list(sampling_params_list)
+            pd_pair = omni._get_pd_separation_pair()
+            if pd_pair is not None:
+                p_id = pd_pair[0]
+                req_sp_list[p_id] = omni._prepare_prefill_sampling_params(req_id, req_sp_list[p_id])
+
+            msg = omni.engine._build_add_request_message(
+                request_id=req_id,
+                prompt=prompt,
+                sampling_params_list=req_sp_list,
+                final_stage_id=final_stage_id,
+            )
+            pending_msgs.append((req_id, msg))
+
+        enqueue_start = time.time()
+        for req_id, msg in pending_msgs:
+            omni.engine.request_queue.sync_q.put_nowait(msg)
+            req_state = omni.request_states[req_id]
+            if req_state.metrics is not None:
+                req_state.metrics.stage_first_ts[0] = enqueue_start
+            req_start_ts[req_id] = enqueue_start
+
+        active_reqs = set(request_ids)
+        outputs: list[Any] = []
+        pbar = tqdm(total=len(request_ids), desc="Processed prompts", dynamic_ncols=True)
+        try:
+            while active_reqs:
+                msg = omni.engine.try_get_output()
+                should_continue, req_id, stage_id, req_state = omni._handle_output_message(msg)
+                if should_continue:
+                    continue
+
+                if req_id not in active_reqs:
+                    continue
+
+                omni._check_engine_output_error(msg, req_id, stage_id)
+                if req_state.metrics is None:
+                    continue
+
+                output = omni._process_single_result(
+                    result=msg,
+                    stage_id=stage_id,
+                    metrics=req_state.metrics,
+                    req_start_ts=req_start_ts,
+                    wall_start_ts=wall_start_ts,
+                    final_stage_id_for_e2e=req_final_stage_ids[req_id],
+                )
+                if output is not None:
+                    outputs.append(output)
+
+                if isinstance(msg, OutputMessage) and msg.finished:
+                    active_reqs.discard(req_id)
+                    pbar.update(1)
+                    omni._log_summary_and_cleanup(req_id)
+        finally:
+            pbar.close()
+
+        return outputs
+    except Exception:
+        if request_ids:
+            omni.abort(request_ids)
+        raise
 
 
 def run_mode(args: argparse.Namespace) -> int:
@@ -369,7 +474,7 @@ def run_mode(args: argparse.Namespace) -> int:
 
     for warmup_idx in range(args.warmup_runs):
         print(f"[warmup] {warmup_idx + 1}/{args.warmup_runs}")
-        list(omni.generate(prompts=prompts, sampling_params_list=params_list))
+        generate_with_batch_admission(omni, prompts, params_list)
 
     if profiler_config is not None:
         print("[profile] start")
@@ -381,7 +486,7 @@ def run_mode(args: argparse.Namespace) -> int:
     for run_idx in range(args.profile_runs):
         print(f"[run] {run_idx + 1}/{args.profile_runs}")
         start = time.perf_counter()
-        outputs = list(omni.generate(prompts=prompts, sampling_params_list=params_list))
+        outputs = generate_with_batch_admission(omni, prompts, params_list)
         elapsed_s = time.perf_counter() - start
 
         serialized_outputs: list[dict[str, Any]] = []

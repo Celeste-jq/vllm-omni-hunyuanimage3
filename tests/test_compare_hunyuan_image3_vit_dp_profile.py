@@ -46,3 +46,10 @@ def test_resolve_profiler_config_returns_none_when_disabled(tmp_path: Path):
     )
 
     assert module.resolve_profiler_config(args, tmp_path) is None
+
+
+def test_build_request_mm_uuids_uses_request_index():
+    module = _load_module()
+
+    assert module.build_request_mm_uuids(0, 1) == {"image": ["req-0-image-0"]}
+    assert module.build_request_mm_uuids(3, 2) == {"image": ["req-3-image-0", "req-3-image-1"]}
