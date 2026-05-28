@@ -106,6 +106,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Convenience flag for the default torch profiler config.",
     )
     parser.add_argument(
+        "--disable-profiler",
+        dest="enable_profiler",
+        action="store_false",
+        default=True,
+        help="Disable torch profiler collection and skip start_profile/stop_profile.",
+    )
+    parser.add_argument(
         "--enable-ar-profiler",
         action="store_true",
         default=True,
@@ -162,6 +169,12 @@ def default_profiler_config(args: argparse.Namespace, profiler_dir: Path) -> dic
     }
 
 
+def resolve_profiler_config(args: argparse.Namespace, profiler_dir: Path) -> dict[str, Any] | None:
+    if not getattr(args, "enable_profiler", True):
+        return None
+    return dict(args.profiler_config) if args.profiler_config is not None else default_profiler_config(args, profiler_dir)
+
+
 def ensure_path_exists(path: str | Path, label: str) -> Path:
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
@@ -179,7 +192,7 @@ def make_output_root(requested: str | None) -> Path:
     return root
 
 
-def write_temp_deploy_configs(base_deploy_path: Path, output_root: Path) -> dict[str, Path]:
+def write_temp_deploy_configs(base_deploy_path: Path, output_root: Path, batch_size: int) -> dict[str, Path]:
     base_text = base_deploy_path.read_text(encoding="utf-8")
     if "mm_encoder_tp_mode: data" not in base_text:
         raise ValueError(
@@ -192,16 +205,29 @@ def write_temp_deploy_configs(base_deploy_path: Path, output_root: Path) -> dict
     on_path = deploy_dir / "hunyuan_image3_ar_vit_dp_on.yaml"
     off_path = deploy_dir / "hunyuan_image3_ar_vit_dp_off.yaml"
 
+    adjusted_max_num_seqs = False
     off_lines: list[str] = []
+    on_lines: list[str] = []
     for line in base_text.splitlines():
+        if line.lstrip().startswith("max_num_seqs:"):
+            indent = line[: len(line) - len(line.lstrip())]
+            rewritten = f"{indent}max_num_seqs: {max(1, batch_size)}"
+            on_lines.append(rewritten)
+            off_lines.append(rewritten)
+            adjusted_max_num_seqs = True
+            continue
+        on_lines.append(line)
         if "mm_encoder_tp_mode:" in line:
             indent = line[: len(line) - len(line.lstrip())]
             off_lines.append(f"{indent}# mm_encoder_tp_mode removed for ViT TP baseline")
             continue
         off_lines.append(line)
+    if not adjusted_max_num_seqs:
+        raise ValueError(f"Base deploy config does not contain max_num_seqs: {base_deploy_path}")
+    on_text = "\n".join(on_lines) + ("\n" if base_text.endswith("\n") else "")
     off_text = "\n".join(off_lines) + ("\n" if base_text.endswith("\n") else "")
 
-    on_path.write_text(base_text, encoding="utf-8")
+    on_path.write_text(on_text, encoding="utf-8")
     off_path.write_text(off_text, encoding="utf-8")
     return {"vit_dp_on": on_path, "vit_dp_off": off_path}
 
@@ -256,6 +282,8 @@ def launch_child(args: argparse.Namespace, output_root: Path, mode: str, deploy_
         child_cmd.append("--profiler-with-flops")
     if args.profiler_dump_cuda_time_total:
         child_cmd.append("--profiler-dump-cuda-time-total")
+    if not args.enable_profiler:
+        child_cmd.append("--disable-profiler")
     if args.enable_ar_profiler:
         child_cmd.append("--enable-ar-profiler")
     else:
@@ -351,10 +379,9 @@ def run_mode(args: argparse.Namespace) -> int:
         ensure_path_exists(image_path, "image path")
     ensure_path_exists(deploy_config, "resolved deploy config")
 
-    profiler_config = dict(args.profiler_config) if args.profiler_config is not None else default_profiler_config(
-        args, profiler_dir
-    )
-    profiler_config["torch_profiler_dir"] = str(profiler_dir)
+    profiler_config = resolve_profiler_config(args, profiler_dir)
+    if profiler_config is not None:
+        profiler_config["torch_profiler_dir"] = str(profiler_dir)
 
     print("=" * 72)
     print(f"[mode] {mode}")
@@ -398,8 +425,9 @@ def run_mode(args: argparse.Namespace) -> int:
         print(f"[warmup] {warmup_idx + 1}/{args.warmup_runs}")
         list(omni.generate(prompts=prompts, sampling_params_list=params_list))
 
-    print("[profile] start")
-    omni.start_profile(profile_prefix=mode)
+    if profiler_config is not None:
+        print("[profile] start")
+        omni.start_profile(profile_prefix=mode)
 
     run_summaries: list[dict[str, Any]] = []
     outputs_path = mode_dir / "outputs.json"
@@ -442,8 +470,10 @@ def run_mode(args: argparse.Namespace) -> int:
         run_summaries.append(run_summary)
         print(f"[run] elapsed_s={elapsed_s:.4f} num_requests={len(outputs)}")
 
-    print("[profile] stop")
-    profile_results = omni.stop_profile()
+    profile_results = None
+    if profiler_config is not None:
+        print("[profile] stop")
+        profile_results = omni.stop_profile()
 
     outputs_path.write_text(json.dumps(run_summaries, ensure_ascii=False, indent=2), encoding="utf-8")
     summary = {
@@ -474,7 +504,7 @@ def run_mode(args: argparse.Namespace) -> int:
 def run_parent(args: argparse.Namespace) -> int:
     base_deploy = ensure_path_exists(args.deploy_config, "deploy config")
     output_root = make_output_root(args.output_root)
-    deploy_configs = write_temp_deploy_configs(base_deploy, output_root)
+    deploy_configs = write_temp_deploy_configs(base_deploy, output_root, batch_size=args.batch_size)
 
     results: dict[str, Any] = {"output_root": str(output_root), "modes": {}}
     for mode in ("vit_dp_on", "vit_dp_off"):
