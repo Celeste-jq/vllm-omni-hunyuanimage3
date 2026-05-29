@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import math
+import time
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, ClassVar, Literal, TypeAlias
@@ -97,6 +98,13 @@ from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import Aut
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
 logger = init_logger(__name__)
+
+
+def _sync_for_vit_timing() -> None:
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 @support_torch_compile(
@@ -1862,6 +1870,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             self._logged_vit_encode_state = True
 
         if self.vision_model.use_data_parallel:
+            _sync_for_vit_timing()
+            encode_start = time.perf_counter()
             batch_size = pixel_values.shape[0]
             max_patches = pixel_values.shape[1]
             tp_size = get_tensor_model_parallel_world_size()
@@ -1883,6 +1893,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 local_batch_size,
             )
 
+            _sync_for_vit_timing()
+            forward_start = time.perf_counter()
             if local_count > 0:
                 local_embed = self.vision_model(
                     pixel_values[local_start:local_end],
@@ -1896,6 +1908,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     (0, max_patches, self.config.hidden_size),
                     dtype=aligner_param.dtype,
                 )
+            _sync_for_vit_timing()
+            forward_end = time.perf_counter()
 
             if local_embed.shape[0] < local_batch_size:
                 pad = local_embed.new_zeros(
@@ -1905,13 +1919,40 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 )
                 local_embed = torch.cat((local_embed, pad), dim=0)
 
+            _sync_for_vit_timing()
+            gather_start = time.perf_counter()
             image_embed = tensor_model_parallel_all_gather(local_embed, dim=0)
+            _sync_for_vit_timing()
+            encode_end = time.perf_counter()
+            logger.info(
+                "HunyuanImage3 AR ViT timing: use_data_parallel=True, tp_rank=%s, tp_size=%s, "
+                "global_batch=%s, local_count=%s, local_batch_size=%s, forward_ms=%.3f, "
+                "all_gather_ms=%.3f, total_ms=%.3f",
+                tp_rank,
+                tp_size,
+                batch_size,
+                local_count,
+                local_batch_size,
+                (forward_end - forward_start) * 1000,
+                (encode_end - gather_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
             return image_embed[:batch_size]
 
+        _sync_for_vit_timing()
+        encode_start = time.perf_counter()
         image_embed = self.vision_model(
             pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
         )
         image_embed = self.vision_aligner(image_embed)
+        _sync_for_vit_timing()
+        encode_end = time.perf_counter()
+        logger.info(
+            "HunyuanImage3 AR ViT timing: use_data_parallel=False, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+            pixel_values.shape[0],
+            (encode_end - encode_start) * 1000,
+            (encode_end - encode_start) * 1000,
+        )
         return image_embed
 
     def _timestep_encode(
