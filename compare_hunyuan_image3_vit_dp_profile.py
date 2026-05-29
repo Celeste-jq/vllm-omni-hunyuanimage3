@@ -266,8 +266,18 @@ def print_deploy_preflight(
         )
 
 
-def build_request_mm_uuids(req_idx: int, num_images: int) -> dict[str, list[str]]:
-    return {"image": [f"req-{req_idx}-image-{image_idx}" for image_idx in range(num_images)]}
+def build_request_mm_uuids(req_idx: int, num_images: int, batch_id: str | None = None) -> dict[str, list[str]]:
+    prefix = f"{batch_id}-" if batch_id else ""
+    return {"image": [f"{prefix}req-{req_idx}-image-{image_idx}" for image_idx in range(num_images)]}
+
+
+def count_prompt_images(prompt: dict[str, Any]) -> int:
+    image_payload = prompt.get("multi_modal_data", {}).get("image")
+    if image_payload is None:
+        return 0
+    if isinstance(image_payload, (list, tuple)):
+        return len(image_payload)
+    return 1
 
 
 def build_formatted_prompts(
@@ -308,9 +318,6 @@ def build_formatted_prompts(
                 "use_system_prompt": None,
                 "modalities": ["text"],
                 "multi_modal_data": {"image": mm_payload},
-                # Give each request a distinct multimodal cache key so repeated
-                # use of the same image still exercises runtime ViT encoding.
-                "multi_modal_uuids": build_request_mm_uuids(req_idx, len(images)),
                 "stop_token_ids": token_stop_ids,
             }
         )
@@ -335,7 +342,11 @@ def generate_with_batch_admission(omni: Any, prompts: list[dict[str, Any]], samp
     pending_msgs: list[tuple[str, Any]] = []
 
     try:
-        for req_id, prompt in zip(request_ids, prompts):
+        batch_id = uuid.uuid4().hex
+        for req_idx, (req_id, prompt) in enumerate(zip(request_ids, prompts)):
+            # Use a fresh multimodal cache key for every generation call so
+            # warmup and measured runs both exercise runtime ViT encoding.
+            prompt["multi_modal_uuids"] = build_request_mm_uuids(req_idx, count_prompt_images(prompt), batch_id)
             prompt_modalities = prompt.get("modalities", None)
             final_stage_id = omni._compute_final_stage_id(prompt_modalities)
             req_final_stage_ids[req_id] = final_stage_id

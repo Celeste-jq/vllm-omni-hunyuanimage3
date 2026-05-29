@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import math
+import time
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, ClassVar, Literal, TypeAlias
@@ -97,6 +98,13 @@ from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import Aut
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
 logger = init_logger(__name__)
+
+
+def _sync_for_vit_timing() -> None:
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 @support_torch_compile(
@@ -1875,18 +1883,44 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             )
             self._logged_vit_encode_state = True
 
+        _sync_for_vit_timing()
+        encode_start = time.perf_counter()
+
         if self.use_data_parallel:
             # ViT weights are replicated (disable_tp on every linear); shard the
             # image batch across ranks instead of doing redundant full-batch
             # work on each one.
+            _sync_for_vit_timing()
+            forward_start = time.perf_counter()
             image_embed = self._vit_encode_dp(pixel_values, vit_attention_mask, vit_spatial_shapes)
+            _sync_for_vit_timing()
+            forward_end = time.perf_counter()
         else:
             image_embed = self.vision_model(
                 pixel_values,
                 attention_mask=vit_attention_mask,
                 spatial_shapes=vit_spatial_shapes,
             )
+            _sync_for_vit_timing()
+            forward_end = time.perf_counter()
+
         image_embed = self.vision_aligner(image_embed)
+        _sync_for_vit_timing()
+        encode_end = time.perf_counter()
+        if self.use_data_parallel:
+            logger.info(
+                "HunyuanImage3 AR ViT timing: use_data_parallel=True, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+                pixel_values.shape[0],
+                (forward_end - forward_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
+        else:
+            logger.info(
+                "HunyuanImage3 AR ViT timing: use_data_parallel=False, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+                pixel_values.shape[0],
+                (forward_end - encode_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
         return image_embed
 
     def _vit_encode_dp(
