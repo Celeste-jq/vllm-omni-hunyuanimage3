@@ -1520,6 +1520,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Used when converting VAE-encoded latent space (latents) to token embeddings.
         self.time_embed = TimestepEmbedder(hidden_size=config.hidden_size)
         self.use_vae_data_parallel = getattr(config, "ar_vae_tp_mode", None) == "data"
+        self._logged_vae_encode_state = False
 
         # vision
         self.vision_model = Siglip2VisionTransformer(config.vit)
@@ -1846,7 +1847,28 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         cfg_factor: int = 1,
     ) -> list[torch.Tensor]:
         batch_size = len(vae_pixel_values)
+        if not self._logged_vae_encode_state:
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                tp_size = -1
+                tp_rank = -1
+            logger.info(
+                "HunyuanImage3 AR VAE encode state: use_data_parallel=%s, tp_rank=%s, tp_size=%s, batch_size=%s",
+                self.use_vae_data_parallel,
+                tp_rank,
+                tp_size,
+                batch_size,
+            )
+            self._logged_vae_encode_state = True
+
         if not self.use_vae_data_parallel or batch_size <= 1:
+            if self.use_vae_data_parallel and batch_size <= 1:
+                logger.info(
+                    "HunyuanImage3 AR VAE DP skipped: global_batch=%s requires batch_size > 1",
+                    batch_size,
+                )
             vae_token_embeddings = []
             for vae_image_i in vae_pixel_values:
                 t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), cfg_factor)
