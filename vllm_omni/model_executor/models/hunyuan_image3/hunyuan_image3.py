@@ -107,6 +107,14 @@ def _sync_for_vit_timing() -> None:
         torch.cuda.synchronize()
 
 
+def _is_hunyuan_image3_vae_use_data_parallel(
+    vllm_config: VllmConfig,
+    hf_config: PretrainedConfig,
+) -> bool:
+    del vllm_config
+    return getattr(hf_config, "ar_vae_tp_mode", None) == "data"
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -1528,6 +1536,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # Used when converting VAE-encoded latent space (latents) to token embeddings.
         self.time_embed = TimestepEmbedder(hidden_size=config.hidden_size)
+        self.use_vae_data_parallel = _is_hunyuan_image3_vae_use_data_parallel(vllm_config, config)
+        self._logged_vae_encode_state = False
 
         # vision
         self.vision_model = Siglip2VisionTransformer(
@@ -1955,6 +1965,131 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         )
         return image_embed
 
+    def _vae_token_encode(
+        self,
+        vae_pixel_values: list[torch.Tensor],
+        vae_token_grid_hw: torch.Tensor,
+        cfg_factor: int = 1,
+    ) -> list[torch.Tensor]:
+        batch_size = len(vae_pixel_values)
+        if batch_size == 0:
+            return []
+
+        if not self._logged_vae_encode_state:
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                tp_size = -1
+                tp_rank = -1
+            logger.info(
+                "HunyuanImage3 AR VAE encode state: use_data_parallel=%s, tp_rank=%s, tp_size=%s, batch_size=%s",
+                self.use_vae_data_parallel,
+                tp_rank,
+                tp_size,
+                batch_size,
+            )
+            self._logged_vae_encode_state = True
+
+        if not self.use_vae_data_parallel:
+            vae_token_embeddings = []
+            _sync_for_vit_timing()
+            encode_start = time.perf_counter()
+            for vae_image_i in vae_pixel_values:
+                t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), cfg_factor)
+                t_emb = self.time_embed(t_i[0])
+                vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
+                vae_token_embeddings.append(vae_tokens)
+            _sync_for_vit_timing()
+            encode_end = time.perf_counter()
+            logger.info(
+                "HunyuanImage3 AR VAE timing: use_data_parallel=False, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+                batch_size,
+                (encode_end - encode_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
+            return vae_token_embeddings
+
+        _sync_for_vit_timing()
+        encode_start = time.perf_counter()
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        local_batch_size = math.ceil(batch_size / tp_size)
+        local_start = tp_rank * local_batch_size
+        local_end = min(local_start + local_batch_size, batch_size)
+        local_count = max(local_end - local_start, 0)
+        token_counts = (vae_token_grid_hw[:, 0] * vae_token_grid_hw[:, 1]).to(dtype=torch.long)
+        max_token_count = int(token_counts.max().item())
+
+        logger.info(
+            "HunyuanImage3 AR VAE DP shard: tp_rank=%s, tp_size=%s, global_batch=%s, "
+            "local_range=[%s,%s), local_count=%s, local_batch_size=%s, max_token_count=%s",
+            tp_rank,
+            tp_size,
+            batch_size,
+            local_start,
+            local_end,
+            local_count,
+            local_batch_size,
+            max_token_count,
+        )
+
+        patch_param = next(self.patch_embed.parameters())
+        local_token_list: list[torch.Tensor] = []
+        _sync_for_vit_timing()
+        forward_start = time.perf_counter()
+        for img_idx in range(local_start, local_end):
+            vae_image_i = vae_pixel_values[img_idx]
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), cfg_factor)
+            t_emb = self.time_embed(t_i[0])
+            vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
+            if vae_tokens.ndim == 3:
+                vae_tokens = vae_tokens.squeeze(0)
+            token_count = int(token_counts[img_idx].item())
+            if vae_tokens.shape[0] < max_token_count:
+                pad = vae_tokens.new_zeros(max_token_count - vae_tokens.shape[0], vae_tokens.shape[-1])
+                vae_tokens = torch.cat((vae_tokens, pad), dim=0)
+            local_token_list.append(vae_tokens[:max_token_count])
+        _sync_for_vit_timing()
+        forward_end = time.perf_counter()
+
+        if local_count == 0:
+            local_tokens = patch_param.new_zeros((0, max_token_count, self.config.hidden_size))
+        else:
+            local_tokens = torch.stack(local_token_list, dim=0).to(dtype=patch_param.dtype)
+
+        if local_tokens.shape[0] < local_batch_size:
+            pad = patch_param.new_zeros(
+                (local_batch_size - local_tokens.shape[0], max_token_count, self.config.hidden_size)
+            )
+            local_tokens = torch.cat((local_tokens, pad), dim=0)
+
+        _sync_for_vit_timing()
+        gather_start = time.perf_counter()
+        gathered_tokens = tensor_model_parallel_all_gather(local_tokens, dim=0)[:batch_size]
+        _sync_for_vit_timing()
+        encode_end = time.perf_counter()
+        logger.info(
+            "HunyuanImage3 AR VAE timing: use_data_parallel=True, tp_rank=%s, tp_size=%s, "
+            "global_batch=%s, local_count=%s, local_batch_size=%s, max_token_count=%s, "
+            "forward_ms=%.3f, all_gather_ms=%.3f, total_ms=%.3f",
+            tp_rank,
+            tp_size,
+            batch_size,
+            local_count,
+            local_batch_size,
+            max_token_count,
+            (forward_end - forward_start) * 1000,
+            (encode_end - gather_start) * 1000,
+            (encode_end - encode_start) * 1000,
+        )
+
+        vae_token_embeddings = []
+        for img_idx in range(batch_size):
+            token_count = int(token_counts[img_idx].item())
+            vae_token_embeddings.append(gathered_tokens[img_idx : img_idx + 1, :token_count, :])
+        return vae_token_embeddings
+
     def _timestep_encode(
         self,
         timestep: torch.Tensor,
@@ -1985,18 +2120,19 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = pixel_values["vit_pixel_attention_mask"]
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
+        vae_token_grid_hw = pixel_values["vae_token_grid_hw"]
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
 
-        # VAE encode + patch_embed per image — each cond image is at its own
-        # `reso_group` bucket so shapes are ragged across the image-batch dim.
-        vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor)
-            t_emb = self.time_embed(t_i[0])
-            vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
-            vae_token_embeddings.append(vae_tokens)
+        # VAE encode + patch_embed per image. The VAE image inputs are ragged
+        # across the image-batch dim, so DP shards the image list and gathers
+        # padded token blocks back by image order.
+        vae_token_embeddings = self._vae_token_encode(
+            vae_pixel_values,
+            vae_token_grid_hw,
+            vae_cfg_factor,
+        )
 
         assert vit_embeddings is not None and vit_embeddings.shape[0] == len(vae_token_embeddings), (
             f"Number of ViT embeddings ({vit_embeddings.shape[0]}) does not match "
