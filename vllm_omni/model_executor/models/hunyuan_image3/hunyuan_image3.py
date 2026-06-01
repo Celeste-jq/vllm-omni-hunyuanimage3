@@ -1845,7 +1845,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vae_token_grid_hw: torch.Tensor,
         cfg_factor: int = 1,
     ) -> list[torch.Tensor]:
-        if not self.use_vae_data_parallel:
+        batch_size = len(vae_pixel_values)
+        if not self.use_vae_data_parallel or batch_size <= 1:
             vae_token_embeddings = []
             for vae_image_i in vae_pixel_values:
                 t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), cfg_factor)
@@ -1854,7 +1855,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 vae_token_embeddings.append(vae_tokens)
             return vae_token_embeddings
 
-        batch_size = len(vae_pixel_values)
         if batch_size == 0:
             return []
 
