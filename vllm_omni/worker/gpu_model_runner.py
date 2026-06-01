@@ -1325,6 +1325,29 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _maybe_run_mm_batch_preprocess(self, req_ids: list[str], device: torch.device) -> None:
+        """Run an optional model-specific multimodal batch preprocess hook."""
+        preprocess_mm_batch = getattr(self.model, "preprocess_mm_batch", None)
+        if not callable(preprocess_mm_batch):
+            return
+
+        for req_id in req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            mm_features = getattr(req_state, "mm_features", None)
+            if not mm_features:
+                continue
+            req_infos = self.model_intermediate_buffer.setdefault(req_id, {})
+            req_infos.setdefault("mm_features", mm_features)
+            req_infos.setdefault("request_id", req_id)
+
+        preprocess_mm_batch(
+            req_ids=req_ids,
+            model_intermediate_buffer=self.model_intermediate_buffer,
+            device=device,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1346,6 +1369,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
+                self._maybe_run_mm_batch_preprocess(self.input_batch.req_ids, self.device)
                 self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 

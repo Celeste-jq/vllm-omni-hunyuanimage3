@@ -346,6 +346,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
                     ) as ec_connector_output:
+                        self._maybe_run_mm_batch_preprocess(self.input_batch.req_ids, self.device)
                         self._execute_mm_encoder(scheduler_output)
 
                         kv_ids = self.kv_extracted_req_ids
