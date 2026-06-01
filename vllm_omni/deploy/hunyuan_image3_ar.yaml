@@ -16,6 +16,8 @@ stages:
     devices: "0,1,2,3"
     tensor_parallel_size: 4
     hf_overrides:
+      # Set to `data` to enable AR VAE image-level DP sharding.
+      # ar_vae_tp_mode: data
       rope_parameters:
         mrope_section: [0, 32, 32]
         rope_type: default
