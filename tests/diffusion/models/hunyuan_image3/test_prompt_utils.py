@@ -124,58 +124,6 @@ def test_resolve_stop_token_ids_image_tasks_stop_on_ratio_range():
     assert resolve_stop_token_ids(task="i2t", bot_task=None, tokenizer=tok) == [answer_id]
     assert resolve_stop_token_ids(task="t2t", bot_task=None, tokenizer=tok) == [answer_id]
 
-    # image_size="auto" is equivalent to None (need_ratio=True).
-    for bot in ("think", "recaption", "think_recaption", "vanilla"):
-        assert resolve_stop_token_ids(task="t2i", bot_task=bot, tokenizer=tok, image_size="auto") == expected
-        assert resolve_stop_token_ids(task="it2i", bot_task=bot, tokenizer=tok, image_size="auto") == expected
-
-
-def test_resolve_stop_token_ids_explicit_image_size_stops_on_terminator():
-    """When image_size is an explicit "WxH" string, need_ratio=False: AR
-    already knows the size and stops at the cot terminator instead of the
-    ratio range.
-
-    Mirrors upstream logic where ``need_ratio`` is false when the user
-    supplies a target size, so ``final_stop_tokens`` is set to the
-    recaption/think terminator (not the ratio tokens).
-    """
-    tok = FakeTokenizer()
-
-    end_of_think_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"]
-    end_of_recaption_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]
-
-    # think_recaption / recaption -> [end_of_recaption]
-    for bot in ("think_recaption", "recaption"):
-        for task in ("t2i", "it2i"):
-            result = resolve_stop_token_ids(task=task, bot_task=bot, tokenizer=tok, image_size="1024x1024")
-            assert result == [end_of_recaption_id], (
-                f"task={task}, bot_task={bot}, image_size='1024x1024': expected [{end_of_recaption_id}], got {result}"
-            )
-
-    # think -> [end_of_think, end_of_recaption]
-    for task in ("t2i", "it2i"):
-        result = resolve_stop_token_ids(task=task, bot_task="think", tokenizer=tok, image_size="1024x1024")
-        assert result == [end_of_think_id, end_of_recaption_id], (
-            f"task={task}, bot_task='think', image_size='1024x1024': "
-            f"expected [{end_of_think_id}, {end_of_recaption_id}], got {result}"
-        )
-
-    # vanilla -> no early return, falls through to ratio range
-    start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
-    end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
-    other_start = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_33>"]
-    other_end = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_36>"]
-    expected_ratio = list(range(start, end + 1)) + list(range(other_start, other_end + 1))
-    for task in ("t2i", "it2i"):
-        result = resolve_stop_token_ids(task=task, bot_task="vanilla", tokenizer=tok, image_size="1024x1024")
-        assert result == expected_ratio, (
-            f"task={task}, bot_task='vanilla', image_size='1024x1024': expected ratio range, got {result}"
-        )
-
-    # Text tasks are unaffected by image_size.
-    answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
-    assert resolve_stop_token_ids(task="i2t", bot_task=None, tokenizer=tok, image_size="1024x1024") == [answer_id]
-
 
 @pytest.mark.parametrize(
     "task,bot_task",
@@ -309,6 +257,18 @@ def test_end2end_routes_through_shared_prompt_utils():
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     expected_imports = {"build_prompt_tokens", "resolve_stop_token_ids", "resolve_sys_type"}
     assert expected_imports <= imported_from_prompt_utils
+
+
+def test_end2end_img2img_explicit_size_overrides_diffusion_params():
+    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+    source = end2end_path.read_text(encoding="utf-8")
+
+    assert 'raise ValueError("--height and --width must be provided together.")' in source
+    assert 'prompt_dict["height"] = args.height if explicit_output_size else input_images[0].height' in source
+    assert 'prompt_dict["width"] = args.width if explicit_output_size else input_images[0].width' in source
+    assert 'elif args.modality == "img2img" and explicit_output_size:' in source
+    assert "sp.height = args.height" in source
+    assert "sp.width = args.width" in source
 
 
 _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"
