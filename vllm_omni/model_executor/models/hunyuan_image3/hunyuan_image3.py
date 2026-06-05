@@ -5,7 +5,7 @@ import math
 import time
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Literal, TypeAlias
+from typing import Any, ClassVar, Literal, TypeAlias
 
 import numpy as np
 import regex as re
@@ -1464,7 +1464,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
+    supports_encoder_tp_data: ClassVar[bool] = True
     prefer_model_sampler = True
+
+    # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
+    # weights are replicated and the image batch is sharded across TP ranks.
+    # Without this flag, vLLM silently falls back to "weights" (TP). See
+    # _vit_encode_dp.
+    supports_encoder_tp_data = True
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1533,6 +1540,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.time_embed = TimestepEmbedder(hidden_size=config.hidden_size)
 
         # vision
+        multimodal_config = vllm_config.model_config.multimodal_config
+        self.multimodal_config = multimodal_config
+        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.vision_model = Siglip2VisionTransformer(
             config.vit,
             quant_config=quant_config,
@@ -1856,7 +1866,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 tp_size = -1
                 tp_rank = -1
             logger.info(
-                "HunyuanImage3 AR ViT encode state: tp_rank=%s, tp_size=%s, batch_size=%s",
+                "HunyuanImage3 AR ViT encode state: use_data_parallel=%s, tp_rank=%s, tp_size=%s, batch_size=%s",
+                self.use_data_parallel,
                 tp_rank,
                 tp_size,
                 pixel_values.shape[0],
@@ -1865,24 +1876,87 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         _sync_for_vit_timing()
         encode_start = time.perf_counter()
-        image_embed = self.vision_model(
-            pixel_values,
-            attention_mask=vit_attention_mask,
-            spatial_shapes=vit_spatial_shapes,
-        )
-        _sync_for_vit_timing()
-        forward_end = time.perf_counter()
+
+        if self.use_data_parallel:
+            # ViT weights are replicated (disable_tp on every linear); shard the
+            # image batch across ranks instead of doing redundant full-batch
+            # work on each one.
+            _sync_for_vit_timing()
+            forward_start = time.perf_counter()
+            image_embed = self._vit_encode_dp(pixel_values, vit_attention_mask, vit_spatial_shapes)
+            _sync_for_vit_timing()
+            forward_end = time.perf_counter()
+        else:
+            image_embed = self.vision_model(
+                pixel_values,
+                attention_mask=vit_attention_mask,
+                spatial_shapes=vit_spatial_shapes,
+            )
+            _sync_for_vit_timing()
+            forward_end = time.perf_counter()
 
         image_embed = self.vision_aligner(image_embed)
         _sync_for_vit_timing()
         encode_end = time.perf_counter()
-        logger.info(
-            "HunyuanImage3 AR ViT timing: global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
-            pixel_values.shape[0],
-            (forward_end - encode_start) * 1000,
-            (encode_end - encode_start) * 1000,
-        )
+        if self.use_data_parallel:
+            logger.info(
+                "HunyuanImage3 AR ViT timing: use_data_parallel=True, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+                pixel_values.shape[0],
+                (forward_end - forward_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
+        else:
+            logger.info(
+                "HunyuanImage3 AR ViT timing: use_data_parallel=False, global_batch=%s, forward_ms=%.3f, total_ms=%.3f",
+                pixel_values.shape[0],
+                (forward_end - encode_start) * 1000,
+                (encode_end - encode_start) * 1000,
+            )
         return image_embed
+
+    def _vit_encode_dp(
+        self,
+        pixel_values: torch.Tensor,
+        vit_attention_mask: torch.Tensor,
+        vit_spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Data-parallel ViT: each rank runs a slice of the image batch, then
+        outputs are all-gathered. Mirrors ``run_dp_sharded_vision_model`` but
+        shards the three batched ViT inputs together (pixel_values /
+        attention_mask / spatial_shapes) instead of a single tensor.
+        """
+        num_images = pixel_values.shape[0]
+        world_size = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        num_per_rank = (num_images + world_size - 1) // world_size
+        num_padded = num_per_rank * world_size - num_images
+
+        if num_padded > 0:
+            # Pad the batch so every rank gets an equal slice (required for
+            # all_gather). Dummy images use spatial_shapes (1, 1) with a single
+            # valid patch: Siglip2 interpolates position embeddings per image
+            # and rejects size 0, so (0, 0) padding would crash. Their outputs
+            # are dropped after the gather.
+            pad_pixels = pixel_values.new_zeros((num_padded, *pixel_values.shape[1:]))
+            pixel_values = torch.cat([pixel_values, pad_pixels], dim=0)
+
+            pad_mask = vit_attention_mask.new_zeros((num_padded, *vit_attention_mask.shape[1:]))
+            pad_mask[:, 0] = 1
+            vit_attention_mask = torch.cat([vit_attention_mask, pad_mask], dim=0)
+
+            pad_shapes = vit_spatial_shapes.new_ones((num_padded, *vit_spatial_shapes.shape[1:]))
+            vit_spatial_shapes = torch.cat([vit_spatial_shapes, pad_shapes], dim=0)
+
+        start = rank * num_per_rank
+        end = start + num_per_rank
+        image_embed = self.vision_model(
+            pixel_values[start:end],
+            attention_mask=vit_attention_mask[start:end],
+            spatial_shapes=vit_spatial_shapes[start:end],
+        )
+        # max_patches (dim 1) is identical across ranks, so dim-0 gather is safe.
+        image_embed = tensor_model_parallel_all_gather(image_embed.contiguous(), dim=0)
+        return image_embed[:num_images]
 
     def _timestep_encode(
         self,
