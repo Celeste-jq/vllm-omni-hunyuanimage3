@@ -47,7 +47,7 @@ class Conversation:
 class TokenizerWrapper:
     def __init__(self, tokenizer):
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         else:
             self.tokenizer = tokenizer
 
