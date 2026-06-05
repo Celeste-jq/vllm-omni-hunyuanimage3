@@ -25,7 +25,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
+_DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml")
 
 
 def parse_args():
@@ -59,6 +59,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--height", type=int, default=None, help="Generated image height. Defaults to input image height.")
+    parser.add_argument("--width", type=int, default=None, help="Generated image width. Defaults to input image width.")
     parser.add_argument("--bot-task", default="think_recaption", choices=["think", "recaption", "think_recaption"])
     parser.add_argument("--sys-type", type=str, default="en_unified")
     parser.add_argument("--vae-use-tiling", action="store_true")
@@ -141,6 +143,8 @@ def build_request_plan(args) -> list[tuple[str, list[str]]]:
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
+    if (args.height is None) != (args.width is None):
+        raise ValueError("Pass --height and --width together, or omit both to use the first input image size.")
 
     additional_config = parse_additional_config(args.additional_config)
     omni_kwargs = {
@@ -162,6 +166,9 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for req_idx, (prompt, image_paths) in enumerate(plan):
         image_payload = load_image_payload(image_paths)
+        first_image = image_payload[0] if isinstance(image_payload, list) else image_payload
+        height = args.height if args.height is not None else first_image.height
+        width = args.width if args.width is not None else first_image.width
         num_images = len(image_paths)
         result = build_prompt_tokens(
             prompt,
@@ -178,8 +185,8 @@ def main():
                 "use_system_prompt": args.sys_type or resolve_sys_type(args.bot_task),
                 "modalities": ["image"],
                 "multi_modal_data": {"image": image_payload},
-                "height": image_payload[0].height if isinstance(image_payload, list) else image_payload.height,
-                "width": image_payload[0].width if isinstance(image_payload, list) else image_payload.width,
+                "height": height,
+                "width": width,
                 "request_index": req_idx,
             }
         )
@@ -201,6 +208,7 @@ def main():
     print(f"  Deploy config: {args.deploy_config}")
     print(f"  Requests: {len(formatted_prompts)}")
     print(f"  Images per request: {[len(paths) for _, paths in plan]}")
+    print(f"  Generated size: {formatted_prompts[0]['width']}x{formatted_prompts[0]['height']}")
     print(f"  Steps: {args.steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Seed: {args.seed}")

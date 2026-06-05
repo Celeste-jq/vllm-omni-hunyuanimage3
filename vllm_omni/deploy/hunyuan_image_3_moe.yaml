@@ -48,6 +48,7 @@ stages:
     devices: "0,1"
     tensor_parallel_size: 2
     hf_overrides:
+      ar_vae_tp_mode: data
       rope_parameters:
         mrope_section: [0, 32, 32]
         rope_type: default
