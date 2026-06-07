@@ -71,6 +71,12 @@ def parse_args():
         default=None,
         help="Optional request count override for batch-admission mode. If set, a single prompt is repeated to this size.",
     )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help="Number of warmup batch-admission runs to execute before the measured run.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -445,6 +451,11 @@ def main():
     print(f"{'=' * 60}\n")
 
     if args.batch_admission:
+        if args.warmup_runs < 0:
+            raise ValueError(f"--warmup-runs must be non-negative, got {args.warmup_runs}")
+        for warmup_idx in range(args.warmup_runs):
+            print(f"[warmup] {warmup_idx + 1}/{args.warmup_runs}")
+            run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list, log_prefix="[warmup]")
         omni_outputs = run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list)
     else:
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
