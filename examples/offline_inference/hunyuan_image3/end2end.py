@@ -5,7 +5,10 @@ HunyuanImage-3.0-Instruct unified end-to-end inference script.
 import argparse
 import json
 import os
+import time
+import uuid
 from pathlib import Path
+from typing import Any
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     MAX_IMAGES_PER_REQUEST,
@@ -14,7 +17,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     resolve_sys_type,
 )
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniPromptType
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml")
@@ -58,6 +60,17 @@ def parse_args():
         help="Input image path(s) for img2img/img2text. Comma-separated for multi-image (up to 3).",
     )
     parser.add_argument("--output", type=str, default=".", help="Output directory to save results.")
+    parser.add_argument(
+        "--batch-admission",
+        action="store_true",
+        help="Enqueue the whole request batch before polling outputs, so the scheduler sees it in one tick.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Optional request count override for batch-admission mode. If set, a single prompt is repeated to this size.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -127,6 +140,165 @@ def parse_additional_config(raw_value: str | None) -> dict | None:
     return additional_config
 
 
+def build_request_mm_uuids(req_idx: int, num_images: int, batch_id: str | None = None) -> dict[str, list[str]]:
+    prefix = f"{batch_id}-" if batch_id else ""
+    return {"image": [f"{prefix}req-{req_idx}-image-{image_idx}" for image_idx in range(num_images)]}
+
+
+def count_prompt_images(prompt: dict[str, Any]) -> int:
+    image_payload = prompt.get("multi_modal_data", {}).get("image")
+    if image_payload is None:
+        return 0
+    if isinstance(image_payload, (list, tuple)):
+        return len(image_payload)
+    return 1
+
+
+def build_formatted_prompts(
+    *,
+    prompts: list[str],
+    task: str,
+    bot_task: str | None,
+    sys_type: str | None,
+    modality: str,
+    tokenizer: Any,
+    input_images: list[Any],
+) -> list[dict[str, Any]]:
+    mm_image_payload = (input_images[0] if len(input_images) == 1 else input_images) if input_images else None
+    formatted_prompts: list[dict[str, Any]] = []
+    for prompt in prompts:
+        build_kwargs: dict[str, Any] = {"task": task, "bot_task": bot_task, "sys_type": sys_type}
+        if input_images:
+            build_kwargs["num_images"] = len(input_images)
+        result = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
+        token_ids = result.token_ids
+        effective_sys_type = sys_type or resolve_sys_type(bot_task)
+
+        prompt_dict: dict[str, Any] = {
+            "prompt_token_ids": token_ids,
+            "prompt": prompt,
+            "use_system_prompt": effective_sys_type,
+        }
+        if modality == "text2img":
+            prompt_dict["modalities"] = ["image"]
+        elif modality == "img2img":
+            prompt_dict["modalities"] = ["image"]
+            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
+            prompt_dict["height"] = input_images[0].height
+            prompt_dict["width"] = input_images[0].width
+        elif modality == "img2text":
+            prompt_dict["modalities"] = ["text"]
+            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
+        else:
+            prompt_dict["modalities"] = ["text"]
+        formatted_prompts.append(prompt_dict)
+    return formatted_prompts
+
+
+def run_batch_admission(
+    omni: Omni,
+    *,
+    prompts: list[dict[str, Any]],
+    sampling_params_list: list[Any],
+    log_prefix: str = "[batch-admission]",
+) -> list[Any]:
+    """Submit a batch of requests before polling outputs.
+
+    This mirrors the profile-oriented harness used in the vit-dp sharded
+    branch: all requests are enqueued first so the scheduler can see the
+    entire batch together on the same tick.
+    """
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+    from vllm_omni.engine.messages import OutputMessage
+    from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+
+    sampling_params_list = list(omni.resolve_sampling_params_list(sampling_params_list))
+    sampling_params_list = omni._set_final_only_for_llm_stages(sampling_params_list)
+
+    request_ids = [f"{i}_{uuid.uuid4()}" for i in range(len(prompts))]
+    wall_start_ts = time.time()
+    req_start_ts: dict[str, float] = {}
+    req_final_stage_ids: dict[str, int] = {}
+    pending_msgs: list[tuple[str, Any]] = []
+
+    try:
+        batch_id = uuid.uuid4().hex
+        for req_idx, (req_id, prompt) in enumerate(zip(request_ids, prompts)):
+            prompt["multi_modal_uuids"] = build_request_mm_uuids(req_idx, count_prompt_images(prompt), batch_id)
+            prompt_modalities = prompt.get("modalities", None)
+            final_stage_id = omni._compute_final_stage_id(prompt_modalities)
+            req_final_stage_ids[req_id] = final_stage_id
+
+            metrics = OrchestratorMetrics(
+                omni.num_stages,
+                omni.log_stats,
+                wall_start_ts,
+                final_stage_id,
+            )
+            req_state = ClientRequestState(req_id)
+            req_state.metrics = metrics
+            omni.request_states[req_id] = req_state
+
+            req_sp_list = list(sampling_params_list)
+            pd_pair = omni._get_pd_separation_pair()
+            if pd_pair is not None:
+                p_id = pd_pair[0]
+                req_sp_list[p_id] = omni._prepare_prefill_sampling_params(req_id, req_sp_list[p_id])
+
+            msg = omni.engine._build_add_request_message(
+                request_id=req_id,
+                prompt=prompt,
+                sampling_params_list=req_sp_list,
+                final_stage_id=final_stage_id,
+            )
+            pending_msgs.append((req_id, msg))
+
+        enqueue_start = time.time()
+        for req_id, msg in pending_msgs:
+            omni.engine.request_queue.sync_q.put_nowait(msg)
+            req_state = omni.request_states[req_id]
+            if req_state.metrics is not None:
+                req_state.metrics.stage_first_ts[0] = enqueue_start
+            req_start_ts[req_id] = enqueue_start
+            print(f"{log_prefix} enqueued {req_id}")
+
+        active_reqs = set(request_ids)
+        outputs: list[Any] = []
+        while active_reqs:
+            msg = omni.engine.try_get_output()
+            should_continue, req_id, stage_id, req_state = omni._handle_output_message(msg)
+            if should_continue:
+                continue
+
+            if req_id not in active_reqs:
+                continue
+
+            omni._check_engine_output_error(msg, req_id, stage_id)
+            if req_state.metrics is None:
+                continue
+
+            output = omni._process_single_result(
+                result=msg,
+                stage_id=stage_id,
+                metrics=req_state.metrics,
+                req_start_ts=req_start_ts,
+                wall_start_ts=wall_start_ts,
+                final_stage_id_for_e2e=req_final_stage_ids[req_id],
+            )
+            if output is not None:
+                outputs.append(output)
+
+            if isinstance(msg, OutputMessage) and msg.finished:
+                active_reqs.discard(req_id)
+                omni._log_summary_and_cleanup(req_id)
+
+        return outputs
+    except Exception:
+        if request_ids:
+            omni.abort(request_ids)
+        raise
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -192,35 +364,26 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    mm_image_payload = (input_images[0] if len(input_images) == 1 else input_images) if input_images else None
+    if args.batch_size is not None:
+        if args.batch_size <= 0:
+            raise ValueError(f"--batch-size must be positive, got {args.batch_size}")
+        if len(prompts) == 1:
+            prompts = prompts * args.batch_size
+        elif len(prompts) != args.batch_size:
+            raise ValueError(
+                f"--batch-size={args.batch_size} requires either one prompt to replicate or "
+                f"exactly {args.batch_size} prompts, got {len(prompts)}"
+            )
 
-    formatted_prompts: list[OmniPromptType] = []
-    for prompt in prompts:
-        build_kwargs: dict = {"task": task, "bot_task": bot_task, "sys_type": args.sys_type}
-        if input_images:
-            build_kwargs["num_images"] = len(input_images)
-        result = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
-        token_ids = result.token_ids
-        effective_sys_type = args.sys_type or resolve_sys_type(bot_task)
-
-        prompt_dict: dict = {
-            "prompt_token_ids": token_ids,
-            "prompt": prompt,
-            "use_system_prompt": effective_sys_type,
-        }
-        if args.modality == "text2img":
-            prompt_dict["modalities"] = ["image"]
-        elif args.modality == "img2img":
-            prompt_dict["modalities"] = ["image"]
-            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-            prompt_dict["height"] = input_images[0].height
-            prompt_dict["width"] = input_images[0].width
-        elif args.modality == "img2text":
-            prompt_dict["modalities"] = ["text"]
-            prompt_dict["multi_modal_data"] = {"image": mm_image_payload}
-        else:
-            prompt_dict["modalities"] = ["text"]
-        formatted_prompts.append(prompt_dict)
+    formatted_prompts = build_formatted_prompts(
+        prompts=prompts,
+        task=task,
+        bot_task=bot_task,
+        sys_type=args.sys_type,
+        modality=args.modality,
+        tokenizer=tokenizer,
+        input_images=input_images,
+    )
 
     params_list = list(omni.default_sampling_params_list)
 
@@ -281,7 +444,10 @@ def main():
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
-    omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    if args.batch_admission:
+        omni_outputs = run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list)
+    else:
+        omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
     img_idx = 0
     for req_output in omni_outputs:
         ro = getattr(req_output, "request_output", None)
