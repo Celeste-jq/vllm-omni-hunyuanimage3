@@ -311,30 +311,30 @@ def run_batch_admission(
         raise
 
 
-def _summarize_stage_durations(outputs: list[Any]) -> dict[str, dict[str, float]]:
-    stage_totals: dict[str, float] = {}
+def _summarize_stage_durations(outputs: list[Any]) -> dict[str, Any]:
+    stage_totals_ms: dict[str, float] = {}
     stage_counts: dict[str, int] = {}
     for req_output in outputs:
         stage_durations = getattr(req_output, "stage_durations", {}) or {}
         if not isinstance(stage_durations, dict):
             continue
-        for stage_id, duration_s in stage_durations.items():
+        for stage_id, duration_ms in stage_durations.items():
             try:
                 key = str(stage_id)
-                value = float(duration_s)
+                value = float(duration_ms)
             except (TypeError, ValueError):
                 continue
-            stage_totals[key] = stage_totals.get(key, 0.0) + value
+            stage_totals_ms[key] = stage_totals_ms.get(key, 0.0) + value
             stage_counts[key] = stage_counts.get(key, 0) + 1
 
-    stage_avgs = {
-        stage_id: (stage_totals[stage_id] / stage_counts[stage_id])
-        for stage_id in stage_totals
+    stage_avgs_ms = {
+        stage_id: (stage_totals_ms[stage_id] / stage_counts[stage_id])
+        for stage_id in stage_totals_ms
         if stage_counts.get(stage_id, 0) > 0
     }
     return {
-        "stage_totals_s": stage_totals,
-        "stage_avgs_s": stage_avgs,
+        "stage_totals_ms": stage_totals_ms,
+        "stage_avgs_ms": stage_avgs_ms,
         "stage_counts": {stage_id: int(count) for stage_id, count in stage_counts.items()},
     }
 
@@ -342,22 +342,12 @@ def _summarize_stage_durations(outputs: list[Any]) -> dict[str, dict[str, float]
 def _serialize_outputs(outputs: list[Any]) -> list[dict[str, Any]]:
     serialized_outputs: list[dict[str, Any]] = []
     for req_idx, req_output in enumerate(outputs):
-        ro = getattr(req_output, "request_output", None)
-        text = ""
-        if ro and getattr(ro, "outputs", None):
-            text = "".join(getattr(item, "text", "") or "" for item in ro.outputs)
-        if not text:
-            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
-            if isinstance(ar_text, list):
-                text = "\n".join(part for part in ar_text if part)
-            elif isinstance(ar_text, str):
-                text = ar_text
-
         serialized_outputs.append(
             {
                 "request_index": req_idx,
-                "text": text,
+                "text": _extract_text(req_output),
                 "stage_durations": getattr(req_output, "stage_durations", {}) or {},
+                "metrics": getattr(req_output, "metrics", {}) or {},
             }
         )
     return serialized_outputs
@@ -395,6 +385,39 @@ def _percentile(values: list[float], p: float) -> float:
     return float(ordered[lo] * (1.0 - frac) + ordered[hi] * frac)
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_text(req_output: Any) -> str:
+    ro = getattr(req_output, "request_output", None)
+    text = ""
+    if ro and getattr(ro, "outputs", None):
+        text = "".join(getattr(item, "text", "") or "" for item in ro.outputs)
+    if text:
+        return text
+
+    custom_output = getattr(req_output, "custom_output", {}) or {}
+    ar_text = custom_output.get("ar_generated_text") if isinstance(custom_output, dict) else None
+    if isinstance(ar_text, list):
+        return "\n".join(part for part in ar_text if part)
+    if isinstance(ar_text, str):
+        return ar_text
+    return ""
+
+
 def _benchmark_metrics(
     outputs: list[Any],
     *,
@@ -405,31 +428,37 @@ def _benchmark_metrics(
     tpot_ms: list[float] = []
     total_input_tokens = 0
     total_output_tokens = 0
+    non_empty_text_outputs = 0
 
     for req_output in outputs:
+        if _extract_text(req_output):
+            non_empty_text_outputs += 1
+
         stage_metrics = _first_stage_metrics(req_output)
-        num_tokens_in = int(stage_metrics.get("num_tokens_in") or 0)
-        num_tokens_out = int(stage_metrics.get("num_tokens_out") or 0)
+        num_tokens_in = _safe_int(stage_metrics.get("num_tokens_in"))
+        num_tokens_out = _safe_int(stage_metrics.get("num_tokens_out"))
         total_input_tokens += num_tokens_in
         total_output_tokens += num_tokens_out
 
         ttft = stage_metrics.get("vllm_ttft_ms")
         if ttft is None:
             ttft = stage_metrics.get("serving_time_to_first_output_ms")
-        if ttft is not None:
-            try:
-                ttft_ms.append(float(ttft))
-            except (TypeError, ValueError):
-                pass
+        ttft_value = _safe_float(ttft)
+        if ttft_value is not None:
+            ttft_ms.append(ttft_value)
 
         tpot = stage_metrics.get("vllm_tpot_ms")
         if tpot is None:
             tpot = stage_metrics.get("time_per_output_unit_ms")
-        if tpot is not None:
-            try:
-                tpot_ms.append(float(tpot))
-            except (TypeError, ValueError):
-                pass
+        tpot_value = _safe_float(tpot)
+        if (tpot_value is None or tpot_value <= 0.0) and num_tokens_out > 1:
+            gen_ms = _safe_float(stage_metrics.get("stage_gen_time_ms"))
+            if gen_ms is not None and ttft_value is not None:
+                fallback_tpot = (gen_ms - ttft_value) / (num_tokens_out - 1)
+                if fallback_tpot > 0.0:
+                    tpot_value = fallback_tpot
+        if tpot_value is not None and tpot_value > 0.0:
+            tpot_ms.append(tpot_value)
 
     total_tokens = total_input_tokens + total_output_tokens
     return {
@@ -443,6 +472,8 @@ def _benchmark_metrics(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "num_requests": len(outputs),
+        "non_empty_text_outputs": non_empty_text_outputs,
+        "empty_text_outputs": len(outputs) - non_empty_text_outputs,
     }
 
 
@@ -456,6 +487,10 @@ def _print_benchmark_metrics(metrics: dict[str, Any]) -> None:
     print(f"  P90 TTFT                : {metrics.get('p90_ttft_ms', 0.0):.3f} ms")
     print(f"  P50 TPOT                : {metrics.get('p50_tpot_ms', 0.0):.3f} ms")
     print(f"  Total Token Throughput   : {metrics.get('total_token_throughput', 0.0):.3f} tok/s")
+    print(
+        "  Text Outputs            : "
+        f"{metrics.get('non_empty_text_outputs', 0)}/{metrics.get('num_requests', 0)} non-empty"
+    )
     print("=" * 60)
 
 
@@ -463,15 +498,7 @@ def _emit_outputs(outputs: list[Any], output_dir: str, *, print_prefix: str = ""
     img_idx = 0
     for req_output in outputs:
         ro = getattr(req_output, "request_output", None)
-        txt = ""
-        if ro and getattr(ro, "outputs", None):
-            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-        if not txt:
-            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
-            if isinstance(ar_text, list):
-                txt = "\n".join(text for text in ar_text if text)
-            else:
-                txt = ar_text or ""
+        txt = _extract_text(req_output)
         if txt:
             print(f"{print_prefix}[Output] Text:\n{txt}")
 
