@@ -77,6 +77,12 @@ def parse_args():
         default=0,
         help="Number of warmup batch-admission runs to execute before the measured run.",
     )
+    parser.add_argument(
+        "--profile-runs",
+        type=int,
+        default=1,
+        help="Number of measured batch-admission runs to execute after warmup.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -305,6 +311,181 @@ def run_batch_admission(
         raise
 
 
+def _summarize_stage_durations(outputs: list[Any]) -> dict[str, dict[str, float]]:
+    stage_totals: dict[str, float] = {}
+    stage_counts: dict[str, int] = {}
+    for req_output in outputs:
+        stage_durations = getattr(req_output, "stage_durations", {}) or {}
+        if not isinstance(stage_durations, dict):
+            continue
+        for stage_id, duration_s in stage_durations.items():
+            try:
+                key = str(stage_id)
+                value = float(duration_s)
+            except (TypeError, ValueError):
+                continue
+            stage_totals[key] = stage_totals.get(key, 0.0) + value
+            stage_counts[key] = stage_counts.get(key, 0) + 1
+
+    stage_avgs = {
+        stage_id: (stage_totals[stage_id] / stage_counts[stage_id])
+        for stage_id in stage_totals
+        if stage_counts.get(stage_id, 0) > 0
+    }
+    return {
+        "stage_totals_s": stage_totals,
+        "stage_avgs_s": stage_avgs,
+        "stage_counts": {stage_id: int(count) for stage_id, count in stage_counts.items()},
+    }
+
+
+def _serialize_outputs(outputs: list[Any]) -> list[dict[str, Any]]:
+    serialized_outputs: list[dict[str, Any]] = []
+    for req_idx, req_output in enumerate(outputs):
+        ro = getattr(req_output, "request_output", None)
+        text = ""
+        if ro and getattr(ro, "outputs", None):
+            text = "".join(getattr(item, "text", "") or "" for item in ro.outputs)
+        if not text:
+            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+            if isinstance(ar_text, list):
+                text = "\n".join(part for part in ar_text if part)
+            elif isinstance(ar_text, str):
+                text = ar_text
+
+        serialized_outputs.append(
+            {
+                "request_index": req_idx,
+                "text": text,
+                "stage_durations": getattr(req_output, "stage_durations", {}) or {},
+            }
+        )
+    return serialized_outputs
+
+
+def _first_stage_metrics(req_output: Any) -> dict[str, Any]:
+    metrics = getattr(req_output, "metrics", None) or {}
+    stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, dict) else None
+    if not isinstance(stage_metrics, dict) or not stage_metrics:
+        return {}
+    stage_zero = stage_metrics.get("0")
+    if isinstance(stage_zero, dict):
+        return stage_zero
+    # Fall back to the first stage if stage 0 is absent.
+    first_key = sorted(stage_metrics.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)[0]
+    maybe_metrics = stage_metrics.get(first_key)
+    return maybe_metrics if isinstance(maybe_metrics, dict) else {}
+
+
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    if p <= 0:
+        return float(min(values))
+    if p >= 100:
+        return float(max(values))
+    ordered = sorted(float(v) for v in values)
+    n = len(ordered)
+    rank = (n - 1) * (p / 100.0)
+    lo = int(rank)
+    hi = min(lo + 1, n - 1)
+    if lo == hi:
+        return float(ordered[lo])
+    frac = rank - lo
+    return float(ordered[lo] * (1.0 - frac) + ordered[hi] * frac)
+
+
+def _benchmark_metrics(
+    outputs: list[Any],
+    *,
+    elapsed_s: float,
+    configuration: str,
+) -> dict[str, Any]:
+    ttft_ms: list[float] = []
+    tpot_ms: list[float] = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for req_output in outputs:
+        stage_metrics = _first_stage_metrics(req_output)
+        num_tokens_in = int(stage_metrics.get("num_tokens_in") or 0)
+        num_tokens_out = int(stage_metrics.get("num_tokens_out") or 0)
+        total_input_tokens += num_tokens_in
+        total_output_tokens += num_tokens_out
+
+        ttft = stage_metrics.get("vllm_ttft_ms")
+        if ttft is None:
+            ttft = stage_metrics.get("serving_time_to_first_output_ms")
+        if ttft is not None:
+            try:
+                ttft_ms.append(float(ttft))
+            except (TypeError, ValueError):
+                pass
+
+        tpot = stage_metrics.get("vllm_tpot_ms")
+        if tpot is None:
+            tpot = stage_metrics.get("time_per_output_unit_ms")
+        if tpot is not None:
+            try:
+                tpot_ms.append(float(tpot))
+            except (TypeError, ValueError):
+                pass
+
+    total_tokens = total_input_tokens + total_output_tokens
+    return {
+        "configuration": configuration,
+        "request_throughput": (len(outputs) / elapsed_s) if elapsed_s > 0 else 0.0,
+        "mean_ttft_ms": (sum(ttft_ms) / len(ttft_ms)) if ttft_ms else 0.0,
+        "p50_ttft_ms": _percentile(ttft_ms, 50.0),
+        "p90_ttft_ms": _percentile(ttft_ms, 90.0),
+        "p50_tpot_ms": _percentile(tpot_ms, 50.0),
+        "total_token_throughput": (total_tokens / elapsed_s) if elapsed_s > 0 else 0.0,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "num_requests": len(outputs),
+    }
+
+
+def _print_benchmark_metrics(metrics: dict[str, Any]) -> None:
+    print("=" * 60)
+    print("Benchmark Metrics:")
+    print(f"  Configuration           : {metrics.get('configuration')}")
+    print(f"  Request Throughput      : {metrics.get('request_throughput', 0.0):.3f} req/s")
+    print(f"  Mean TTFT               : {metrics.get('mean_ttft_ms', 0.0):.3f} ms")
+    print(f"  P50 TTFT                : {metrics.get('p50_ttft_ms', 0.0):.3f} ms")
+    print(f"  P90 TTFT                : {metrics.get('p90_ttft_ms', 0.0):.3f} ms")
+    print(f"  P50 TPOT                : {metrics.get('p50_tpot_ms', 0.0):.3f} ms")
+    print(f"  Total Token Throughput   : {metrics.get('total_token_throughput', 0.0):.3f} tok/s")
+    print("=" * 60)
+
+
+def _emit_outputs(outputs: list[Any], output_dir: str, *, print_prefix: str = "") -> None:
+    img_idx = 0
+    for req_output in outputs:
+        ro = getattr(req_output, "request_output", None)
+        txt = ""
+        if ro and getattr(ro, "outputs", None):
+            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
+        if not txt:
+            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+            if isinstance(ar_text, list):
+                txt = "\n".join(text for text in ar_text if text)
+            else:
+                txt = ar_text or ""
+        if txt:
+            print(f"{print_prefix}[Output] Text:\n{txt}")
+
+        images = getattr(req_output, "images", None)
+        if not images and ro and hasattr(ro, "images"):
+            images = ro.images
+        if images:
+            for j, img in enumerate(images):
+                save_path = os.path.join(output_dir, f"output_{img_idx}_{j}.png")
+                img.save(save_path)
+                print(f"{print_prefix}[Output] Saved image to {save_path}")
+            img_idx += 1
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -456,33 +637,59 @@ def main():
         for warmup_idx in range(args.warmup_runs):
             print(f"[warmup] {warmup_idx + 1}/{args.warmup_runs}")
             run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list, log_prefix="[warmup]")
-        omni_outputs = run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list)
+        run_summaries: list[dict[str, Any]] = []
+        outputs_path = os.path.join(args.output, "outputs.json")
+        summary_path = os.path.join(args.output, "summary.json")
+        for run_idx in range(args.profile_runs):
+            print(f"[run] {run_idx + 1}/{args.profile_runs}")
+            start = time.perf_counter()
+            omni_outputs = run_batch_admission(omni, prompts=formatted_prompts, sampling_params_list=params_list)
+            elapsed_s = time.perf_counter() - start
+            serialized_outputs = _serialize_outputs(omni_outputs)
+            benchmark_metrics = _benchmark_metrics(
+                omni_outputs,
+                elapsed_s=elapsed_s,
+                configuration=str(deploy_config or stage_configs_path or _MODALITY_MODE[args.modality]),
+            )
+            run_summary = {
+                "run_index": run_idx,
+                "elapsed_s": elapsed_s,
+                "num_requests": len(omni_outputs),
+                "num_images_per_request": len(input_images),
+                "stage_summary": _summarize_stage_durations(omni_outputs),
+                "benchmark_metrics": benchmark_metrics,
+                "outputs": serialized_outputs,
+            }
+            run_summaries.append(run_summary)
+            print(f"[run] elapsed_s={elapsed_s:.4f} num_requests={len(omni_outputs)}")
+            print(f"[run] stage_summary={run_summary['stage_summary']}")
+            _print_benchmark_metrics(benchmark_metrics)
+            _emit_outputs(omni_outputs, args.output, print_prefix=f"[run {run_idx + 1}] ")
+
+        with open(outputs_path, "w", encoding="utf-8") as f:
+            json.dump(run_summaries, f, ensure_ascii=False, indent=2, default=str)
+        summary = {
+            "mode": _MODALITY_MODE[args.modality],
+            "model": args.model,
+            "deploy_config": deploy_config or stage_configs_path,
+            "image_path": args.image_path,
+            "prompt": args.prompts[0] if args.prompts else None,
+            "batch_size": len(formatted_prompts),
+            "warmup_runs": args.warmup_runs,
+            "profile_runs": args.profile_runs,
+            "batch_admission": True,
+            "benchmark_metrics": run_summaries[-1]["benchmark_metrics"] if run_summaries else {},
+            "outputs_json": outputs_path,
+            "summary_json": summary_path,
+            "runs": run_summaries,
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+        print(f"[done] summary={summary_path}")
+        print(f"[done] outputs={outputs_path}")
     else:
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
-    img_idx = 0
-    for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
-        txt = ""
-        if ro and getattr(ro, "outputs", None):
-            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-        if not txt:
-            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
-            if isinstance(ar_text, list):
-                txt = "\n".join(text for text in ar_text if text)
-            else:
-                txt = ar_text or ""
-        if txt:
-            print(f"[Output] Text:\n{txt}")
-
-        images = getattr(req_output, "images", None)
-        if not images and ro and hasattr(ro, "images"):
-            images = ro.images
-        if images:
-            for j, img in enumerate(images):
-                save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
-                img.save(save_path)
-                print(f"[Output] Saved image to {save_path}")
-            img_idx += 1
+        _emit_outputs(omni_outputs, args.output)
 
 
 if __name__ == "__main__":
